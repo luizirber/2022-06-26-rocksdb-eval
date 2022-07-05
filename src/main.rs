@@ -1,3 +1,4 @@
+use std::cmp;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::BufRead;
@@ -11,13 +12,16 @@ use clap::{Parser, Subcommand};
 use log::info;
 use rayon::prelude::*;
 use rkyv::{Archive, Deserialize, Serialize};
-use rocksdb::{MergeOperands, Options, DB};
+use rocksdb::{MergeOperands, Options};
 
-use sourmash::signature::Signature;
+use sourmash::signature::{Signature, SigsTrait};
 use sourmash::sketch::minhash::{max_hash_for_scaled, KmerMinHash};
 use sourmash::sketch::Sketch;
 
 type DatasetID = u64;
+//type DB = rocksdb::DBWithThreadMode<rocksdb::MultiThreaded>;
+type DB = rocksdb::DBWithThreadMode<rocksdb::SingleThreaded>;
+type SigCounter = counter::Counter<DatasetID>;
 
 fn merge_datasets(
     _: &[u8],
@@ -76,6 +80,41 @@ fn map_hashes_colors(
         } else {
             Some((hash_to_color, colors))
         }
+    */
+}
+
+fn counter_for_query(db: Arc<DB>, query: &KmerMinHash) -> SigCounter {
+    info!("Collecting hashes");
+    let hashes_iter = query.iter_mins().map(|hash| {
+        let mut v = vec![0_u8; 8];
+        (&mut v[..])
+            .write_u64::<LittleEndian>(*hash)
+            .expect("error writing bytes");
+        v
+    });
+
+    info!("Multi get");
+    db.multi_get(hashes_iter)
+        .into_iter()
+        .filter_map(|r| r.ok().unwrap())
+        .flat_map(|raw_datasets| {
+            let new_vals = Datasets::from_slice(&raw_datasets).unwrap();
+            new_vals.0.into_iter()
+        })
+        .collect()
+    /*
+    info!("get");
+    hashes_iter
+        .into_iter()
+        .filter_map(|r| {
+            let datasets = db.get(&r).ok().unwrap();
+            datasets
+        })
+        .flat_map(|raw_datasets| {
+            let new_vals = Datasets::from_slice(&raw_datasets).unwrap();
+            new_vals.0.into_iter()
+        })
+        .collect()
     */
 }
 
@@ -157,18 +196,6 @@ fn index<P: AsRef<Path>>(
             .count();
 
         info!("Processed {} reference sigs", processed_sigs.into_inner());
-
-        /*
-        let mut hash_bytes = [0u8; 8];
-        (&mut hash_bytes[..])
-            .write_u64::<LittleEndian>(1078036129600)
-            .expect("error writing bytes");
-        let r = db.get(&hash_bytes[..])?;
-        assert_eq!(
-            Datasets::from_slice(&r.unwrap()).unwrap(),
-            Datasets::new(&[1, 2, 3, 4, 5, 6])
-        );
-        */
     }
     //let _ = DB::destroy(&opts, n);
     Ok(())
@@ -198,6 +225,57 @@ fn check<P: AsRef<Path>>(output: P) -> Result<(), Box<dyn std::error::Error>> {
     let ksize = Size::from_bytes(kcount);
     let vsize = Size::from_bytes(vcount);
     info!("k: {}, v: {}", ksize.to_string(), vsize.to_string());
+
+    Ok(())
+}
+
+fn search<P: AsRef<Path>>(
+    queries_file: P,
+    siglist: P,
+    index: P,
+    template: Sketch,
+    threshold_bp: usize,
+    output: Option<P>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut threshold = usize::max_value();
+
+    let query_sig = Signature::from_path(queries_file)?;
+    let mut query = None;
+    for sig in &query_sig {
+        if let Some(sketch) = sig.select_sketch(&template) {
+            if let Sketch::MinHash(mh) = sketch {
+                query = Some(mh.clone());
+                // TODO: deal with mh.size() == 0
+                let t = threshold_bp / (cmp::max(mh.size(), 1) * mh.scaled() as usize);
+                threshold = cmp::min(threshold, t);
+            }
+        }
+    }
+    let query = query.unwrap();
+
+    info!("Loading siglist");
+    let sig_files = read_paths(siglist)?;
+    info!("Loaded {} sig paths in siglist", sig_files.len());
+
+    let mut opts = Options::default();
+    opts.create_if_missing(true);
+    opts.set_merge_operator_associative("datasets operator", merge_datasets);
+    let db = Arc::new(DB::open_for_read_only(&opts, index.as_ref(), true)?);
+    info!("Loaded DB");
+
+    info!("Building counter");
+    let counter = counter_for_query(db, &query);
+    info!("Counter built");
+
+    let mut matches: Vec<String> = vec![];
+    for (dataset_id, size) in counter.most_common() {
+        if size >= threshold {
+            matches.push(sig_files[dataset_id as usize].to_str().unwrap().into());
+        } else {
+            break;
+        };
+    }
+    info!("{:?}", matches);
 
     Ok(())
 }
@@ -259,6 +337,35 @@ enum Commands {
         #[clap(parse(from_os_str), short, long)]
         output: PathBuf,
     },
+    Search {
+        /// Query signature
+        #[clap(parse(from_os_str))]
+        query_path: PathBuf,
+
+        /// Precomputed index or list of reference signatures
+        #[clap(parse(from_os_str))]
+        siglist: PathBuf,
+
+        /// Precomputed index or list of reference signatures
+        #[clap(parse(from_os_str))]
+        index: PathBuf,
+
+        /// ksize
+        #[clap(short = 'k', long = "ksize", default_value = "31")]
+        ksize: u8,
+
+        /// scaled
+        #[clap(short = 's', long = "scaled", default_value = "1000")]
+        scaled: usize,
+
+        /// threshold_bp
+        #[clap(short = 't', long = "threshold_bp", default_value = "50000")]
+        threshold_bp: usize,
+
+        /// The path for output
+        #[clap(parse(from_os_str), short = 'o', long = "output")]
+        output: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -280,6 +387,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             index(siglist, template, threshold, output)?
         }
         Check { output } => check(output)?,
+        Search {
+            query_path,
+            output,
+            siglist,
+            index,
+            threshold_bp,
+            ksize,
+            scaled,
+        } => {
+            let template = build_template(ksize, scaled);
+
+            search(query_path, siglist, index, template, threshold_bp, output)?
+        }
     };
 
     Ok(())

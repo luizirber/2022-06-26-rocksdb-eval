@@ -138,6 +138,7 @@
 
             llvmPackages_13.libclang
             llvmPackages_13.libcxxClang
+            llvmPackages_13.lldb
           ];
 
           BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${llvmPackages_13.libclang.lib}/lib/clang/${lib.getVersion clang}/include";
