@@ -1,9 +1,15 @@
 use std::collections::HashSet;
+use std::fs::File;
+use std::io::BufRead;
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use byteorder::{LittleEndian, WriteBytesExt};
+use clap::{Parser, Subcommand};
+use log::info;
+use rayon::prelude::*;
 use rkyv::{Archive, Deserialize, Serialize};
 use rocksdb::{MergeOperands, Options, DB};
 
@@ -38,7 +44,7 @@ fn map_hashes_colors(
     db: Arc<DB>,
     dataset_id: DatasetID,
     search_sig: &Signature,
-    threshold: usize,
+    threshold: f64,
     template: &Sketch,
     //) -> Option<(HashToColor, Datasets)> {
 ) {
@@ -53,6 +59,7 @@ fn map_hashes_colors(
     let matched = search_mh.mins();
     let size = matched.len() as u64;
     if !matched.is_empty() || size > threshold as u64 {
+        // FIXME threshold is f64
         let mut hash_bytes = [0u8; 8];
         for hash in matched {
             (&mut hash_bytes[..])
@@ -104,22 +111,15 @@ impl Datasets {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let n = Path::new("_rocksdb_sourmash_test");
-
-    let max_hash = max_hash_for_scaled(10000);
-    let template = Sketch::MinHash(
-        KmerMinHash::builder()
-            .num(0u32)
-            .ksize(31)
-            .max_hash(max_hash)
-            .build(),
-    );
-    let search_sigs: [PathBuf; 3] = [
-        "tests/test-data/GCF_000006945.2_ASM694v2_genomic.fna.gz.sig".into(),
-        "tests/test-data/GCF_000007545.1_ASM754v1_genomic.fna.gz.sig".into(),
-        "tests/test-data/GCF_000008105.1_ASM810v1_genomic.fna.gz.sig".into(),
-    ];
+fn index<P: AsRef<Path>>(
+    siglist: P,
+    template: Sketch,
+    threshold: f64,
+    output: P,
+) -> Result<(), Box<dyn std::error::Error>> {
+    info!("Loading siglist");
+    let index_sigs = read_paths(siglist)?;
+    info!("Loaded {} sig paths in siglist", index_sigs.len());
 
     let mut opts = Options::default();
     opts.create_if_missing(true);
@@ -127,20 +127,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //opts.set_compaction_style(DBCompactionStyle::Universal);
     //opts.set_min_write_buffer_number_to_merge(10);
     {
-        let db = Arc::new(DB::open(&opts, &n).unwrap());
-
-        let threshold = 0;
+        let db = Arc::new(DB::open(&opts, output.as_ref()).unwrap());
 
         let processed_sigs = AtomicUsize::new(0);
-        //let sig_iter = search_sigs.par_iter();
-        let sig_iter = search_sigs.iter();
+        let sig_iter = index_sigs.par_iter();
+        //let sig_iter = index_sigs.iter();
 
         let _filtered_sigs = sig_iter
             .enumerate()
             .filter_map(|(dataset_id, filename)| {
                 let i = processed_sigs.fetch_add(1, Ordering::SeqCst);
                 if i % 1000 == 0 {
-                    eprintln!("Processed {} reference sigs", i);
+                    info!("Processed {} reference sigs", i);
                 }
 
                 let search_sig = Signature::from_path(&filename)
@@ -158,7 +156,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .count();
 
-        eprintln!("Processed {} reference sigs", processed_sigs.into_inner());
+        info!("Processed {} reference sigs", processed_sigs.into_inner());
 
         /*
         let mut hash_bytes = [0u8; 8];
@@ -171,17 +169,118 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Datasets::new(&[1, 2, 3, 4, 5, 6])
         );
         */
-
-        /*
-        use byteorder::ReadBytesExt;
-        let mut iter = db.iterator(rocksdb::IteratorMode::Start); // Always iterates forward
-        for (key, value) in iter {
-            let k = (&key[..]).read_u64::<LittleEndian>().unwrap();
-            println!("Saw {} {:?}", k, Datasets::from_slice(&value));
-            //println!("Saw {} {:?}", k, value);
-        }
-        */
     }
     //let _ = DB::destroy(&opts, n);
+    Ok(())
+}
+
+fn check<P: AsRef<Path>>(output: P) -> Result<(), Box<dyn std::error::Error>> {
+    use byteorder::ReadBytesExt;
+
+    let mut opts = Options::default();
+    opts.create_if_missing(true);
+    opts.set_merge_operator_associative("datasets operator", merge_datasets);
+    let db = Arc::new(DB::open_for_read_only(&opts, output.as_ref(), true)?);
+
+    let iter = db.iterator(rocksdb::IteratorMode::Start);
+    let mut kcount = 0;
+    let mut vcount = 0;
+    for (key, value) in iter {
+        let _k = (&key[..]).read_u64::<LittleEndian>()?;
+        kcount += key.len();
+        //println!("Saw {} {:?}", k, Datasets::from_slice(&value));
+        let _v = Datasets::from_slice(&value).expect("Error with value");
+        vcount += value.len();
+        //println!("Saw {} {:?}", k, value);
+    }
+
+    use size::Size;
+    let ksize = Size::from_bytes(kcount);
+    let vsize = Size::from_bytes(vcount);
+    info!("k: {}, v: {}", ksize.to_string(), vsize.to_string());
+
+    Ok(())
+}
+
+fn read_paths<P: AsRef<Path>>(paths_file: P) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let paths = BufReader::new(File::open(paths_file)?);
+    Ok(paths
+        .lines()
+        .map(|line| {
+            let mut path = PathBuf::new();
+            path.push(line.unwrap());
+            path
+        })
+        .collect())
+}
+
+fn build_template(ksize: u8, scaled: usize) -> Sketch {
+    let max_hash = max_hash_for_scaled(scaled as u64);
+    let template_mh = KmerMinHash::builder()
+        .num(0u32)
+        .ksize(ksize as u32)
+        .max_hash(max_hash)
+        .build();
+    Sketch::MinHash(template_mh)
+}
+
+#[derive(Parser, Debug)]
+#[clap(author, version, about, long_about = None)]
+struct Cli {
+    #[clap(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    Index {
+        /// List of signatures to search
+        #[clap(parse(from_os_str))]
+        siglist: PathBuf,
+
+        /// ksize
+        #[clap(short, long, default_value = "31")]
+        ksize: u8,
+
+        /// threshold
+        #[clap(short, long, default_value = "0.85")]
+        threshold: f64,
+
+        /// scaled
+        #[clap(short, long, default_value = "1000")]
+        scaled: usize,
+
+        /// The path for output
+        #[clap(parse(from_os_str), short, long)]
+        output: PathBuf,
+    },
+    Check {
+        /// The path for output
+        #[clap(parse(from_os_str), short, long)]
+        output: PathBuf,
+    },
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    use Commands::*;
+
+    let opts = Cli::parse();
+
+    match opts.command {
+        Index {
+            output,
+            siglist,
+            threshold,
+            ksize,
+            scaled,
+        } => {
+            let template = build_template(ksize, scaled);
+
+            index(siglist, template, threshold, output)?
+        }
+        Check { output } => check(output)?,
+    };
+
     Ok(())
 }

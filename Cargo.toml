@@ -7,7 +7,12 @@ edition = "2021"
 
 [dependencies]
 byteorder = "1.4.3"
+clap = { version = "3.2.8", features = [ "derive" ] }
+env_logger = "0.9.0"
+log = "0.4.17"
+rayon = "1.5.3"
 # rkyv = { version = "0.7.39", features = [ "validation" ] }
 rkyv = "0.7.39"
 rocksdb = "0.18.0"
+size = "0.4.0"
 sourmash = "0.11.0"
