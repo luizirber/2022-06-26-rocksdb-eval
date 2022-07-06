@@ -257,6 +257,19 @@ impl Datasets {
     }
 }
 
+fn open_db(path: &Path, read_only: bool) -> Arc<DB> {
+    let mut opts = Options::default();
+    opts.create_if_missing(true);
+    opts.set_merge_operator_associative("datasets operator", merge_datasets);
+    //opts.set_compaction_style(DBCompactionStyle::Universal);
+    //opts.set_min_write_buffer_number_to_merge(10);
+    if read_only {
+        Arc::new(DB::open_for_read_only(&opts, path, true).unwrap())
+    } else {
+        Arc::new(DB::open(&opts, path).unwrap())
+    }
+}
+
 fn index<P: AsRef<Path>>(
     siglist: P,
     template: Sketch,
@@ -267,54 +280,43 @@ fn index<P: AsRef<Path>>(
     let index_sigs = read_paths(siglist)?;
     info!("Loaded {} sig paths in siglist", index_sigs.len());
 
-    let mut opts = Options::default();
-    opts.create_if_missing(true);
-    opts.set_merge_operator_associative("datasets operator", merge_datasets);
-    //opts.set_compaction_style(DBCompactionStyle::Universal);
-    //opts.set_min_write_buffer_number_to_merge(10);
-    {
-        let db = Arc::new(DB::open(&opts, output.as_ref()).unwrap());
+    let db = open_db(output.as_ref(), false);
 
-        let processed_sigs = AtomicUsize::new(0);
-        let sig_iter = index_sigs.par_iter();
-        //let sig_iter = index_sigs.iter();
+    let processed_sigs = AtomicUsize::new(0);
+    let sig_iter = index_sigs.par_iter();
+    //let sig_iter = index_sigs.iter();
 
-        let _filtered_sigs = sig_iter
-            .enumerate()
-            .filter_map(|(dataset_id, filename)| {
-                let i = processed_sigs.fetch_add(1, Ordering::SeqCst);
-                if i % 1000 == 0 {
-                    info!("Processed {} reference sigs", i);
-                }
+    let _filtered_sigs = sig_iter
+        .enumerate()
+        .filter_map(|(dataset_id, filename)| {
+            let i = processed_sigs.fetch_add(1, Ordering::SeqCst);
+            if i % 1000 == 0 {
+                info!("Processed {} reference sigs", i);
+            }
 
-                let search_sig = Signature::from_path(&filename)
-                    .unwrap_or_else(|_| panic!("Error processing {:?}", filename))
-                    .swap_remove(0);
+            let search_sig = Signature::from_path(&filename)
+                .unwrap_or_else(|_| panic!("Error processing {:?}", filename))
+                .swap_remove(0);
 
-                map_hashes_colors(
-                    db.clone(),
-                    dataset_id as DatasetID,
-                    &search_sig,
-                    threshold,
-                    &template,
-                );
-                Some(true)
-            })
-            .count();
+            map_hashes_colors(
+                db.clone(),
+                dataset_id as DatasetID,
+                &search_sig,
+                threshold,
+                &template,
+            );
+            Some(true)
+        })
+        .count();
 
-        info!("Processed {} reference sigs", processed_sigs.into_inner());
-    }
-    //let _ = DB::destroy(&opts, n);
+    info!("Processed {} reference sigs", processed_sigs.into_inner());
     Ok(())
 }
 
 fn check<P: AsRef<Path>>(output: P) -> Result<(), Box<dyn std::error::Error>> {
     use byteorder::ReadBytesExt;
 
-    let mut opts = Options::default();
-    opts.create_if_missing(true);
-    opts.set_merge_operator_associative("datasets operator", merge_datasets);
-    let db = Arc::new(DB::open_for_read_only(&opts, output.as_ref(), true)?);
+    let db = open_db(output.as_ref(), true);
 
     let iter = db.iterator(rocksdb::IteratorMode::Start);
     let mut kcount = 0;
@@ -364,10 +366,7 @@ fn search<P: AsRef<Path>>(
     let sig_files = read_paths(siglist)?;
     info!("Loaded {} sig paths in siglist", sig_files.len());
 
-    let mut opts = Options::default();
-    opts.create_if_missing(true);
-    opts.set_merge_operator_associative("datasets operator", merge_datasets);
-    let db = Arc::new(DB::open_for_read_only(&opts, index.as_ref(), true)?);
+    let db = open_db(index.as_ref(), true);
     info!("Loaded DB");
 
     info!("Building counter");
