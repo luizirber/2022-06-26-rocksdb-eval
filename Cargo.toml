@@ -16,4 +16,6 @@ rayon = "1.5.3"
 rkyv = "0.7.39"
 rocksdb = "0.18.0"
 size = "0.4.0"
-sourmash = "0.11.0"
+#sourmash = "0.11.0"
+sourmash = { git = "https://github.com/sourmash-bio/sourmash", tag = "v4.4.0" }
+twox-hash = "1.6.3"

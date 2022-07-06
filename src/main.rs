@@ -1,6 +1,7 @@
 use std::cmp;
 use std::collections::HashSet;
 use std::fs::File;
+use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
 use std::io::BufRead;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -18,10 +19,13 @@ use sourmash::signature::{Signature, SigsTrait};
 use sourmash::sketch::minhash::{max_hash_for_scaled, KmerMinHash};
 use sourmash::sketch::Sketch;
 
-type DatasetID = u64;
-//type DB = rocksdb::DBWithThreadMode<rocksdb::MultiThreaded>;
 type DB = rocksdb::DBWithThreadMode<rocksdb::SingleThreaded>;
+//type DB = rocksdb::DBWithThreadMode<rocksdb::MultiThreaded>;
+
+type DatasetID = u64;
 type SigCounter = counter::Counter<DatasetID>;
+
+type Color = u64;
 
 fn merge_datasets(
     _: &[u8],
@@ -115,6 +119,109 @@ fn counter_for_query(db: Arc<DB>, query: &KmerMinHash) -> SigCounter {
             new_vals.0.into_iter()
         })
         .collect()
+    */
+}
+
+#[derive(Default, Debug, PartialEq, Clone, Archive, Serialize, Deserialize)]
+pub struct Colors;
+
+impl Colors {
+    pub fn new() -> Colors {
+        Default::default()
+    }
+
+    /// Given a color and a new idx, return an updated color
+    ///
+    /// This might create a new one, or find an already existing color
+    /// that contains the new_idx
+    ///
+    /// Future optimization: store a count for each color, so we can track
+    /// if there are extra colors that can be removed at the end.
+    /// (the count is decreased whenever a new color has to be created)
+    pub fn update<'a, I: IntoIterator<Item = &'a DatasetID>>(
+        db: Arc<DB>,
+        current_color: Option<Color>,
+        new_idxs: I,
+    ) -> Result<Color, Box<dyn std::error::Error>> {
+        if let Some(color) = current_color {
+            let mut color_bytes = [0u8; 8];
+            (&mut color_bytes[..])
+                .write_u64::<LittleEndian>(color)
+                .expect("error writing bytes");
+
+            if let Some(idxs) = db.get(&color_bytes)? {
+                let idxs = Datasets::from_slice(&idxs).unwrap();
+                let idx_to_add: Vec<_> = new_idxs
+                    .into_iter()
+                    .filter(|new_idx| !idxs.0.contains(new_idx))
+                    .collect();
+
+                if idx_to_add.is_empty() {
+                    // Easy case, it already has all the new_idxs, so just return this color
+                    Ok(color)
+                } else {
+                    // We need to either create a new color,
+                    // or find an existing color that have the same idxs
+
+                    let mut idxs = idxs.clone();
+                    idxs.0.extend(idx_to_add.into_iter().cloned());
+                    let new_color = Colors::compute_color(&idxs);
+
+                    // FIXME db.entry(new_color).or_insert_with(|| idxs);
+                    Ok(new_color)
+                }
+            } else {
+                unimplemented!("throw error, current_color must exist in order to be updated. current_color: {:?}", current_color);
+            }
+        } else {
+            let mut idxs = Datasets::default();
+            idxs.0.extend(new_idxs.into_iter().cloned());
+            let new_color = Colors::compute_color(&idxs);
+            // FIXME db.entry(new_color).or_insert_with(|| idxs);
+            Ok(new_color)
+        }
+    }
+
+    fn compute_color(idxs: &Datasets) -> Color {
+        let s = BuildHasherDefault::<twox_hash::Xxh3Hash128>::default();
+        let mut hasher = s.build_hasher();
+        // TODO: remove this...
+        let mut sorted: Vec<_> = idxs.0.iter().collect();
+        sorted.sort();
+        sorted.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /*
+    pub fn len(&self) -> usize {
+        self.colors.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.colors.is_empty()
+    }
+
+    pub fn contains(&self, color: Color, idx: DatasetID) -> bool {
+        if let Some(idxs) = self.colors.get(&color) {
+            idxs.0.contains(&idx)
+        } else {
+            false
+        }
+    }
+
+    pub fn indices(&self, color: &Color) -> Indices {
+        // TODO: what if color is not present?
+        Indices {
+            iter: self.colors.get(color).unwrap().0.iter(),
+        }
+    }
+
+    pub fn retain<F>(&mut self, f: F)
+    where
+        F: FnMut(&Color, &mut Datasets) -> bool,
+    {
+        self.colors.retain(f)
+    }
     */
 }
 
