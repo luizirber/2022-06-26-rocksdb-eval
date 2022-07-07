@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use byteorder::{LittleEndian, WriteBytesExt};
 use clap::{Parser, Subcommand};
+use histogram::Histogram;
 use log::info;
 use rayon::prelude::*;
 use rkyv::{Archive, Deserialize, Serialize};
@@ -48,6 +49,58 @@ fn merge_datasets(
     //    }
 }
 
+fn check_compatible_downsample(
+    me: &KmerMinHash,
+    other: &KmerMinHash,
+) -> Result<(), sourmash::Error> {
+    /*
+    if self.num != other.num {
+        return Err(Error::MismatchNum {
+            n1: self.num,
+            n2: other.num,
+        }
+        .into());
+    }
+    */
+    use sourmash::Error;
+
+    if me.ksize() != other.ksize() {
+        return Err(Error::MismatchKSizes);
+    }
+    if me.hash_function() != other.hash_function() {
+        // TODO: fix this error
+        return Err(Error::MismatchDNAProt);
+    }
+    if me.max_hash() < other.max_hash() {
+        return Err(Error::MismatchScaled);
+    }
+    if me.seed() != other.seed() {
+        return Err(Error::MismatchSeed);
+    }
+    Ok(())
+}
+
+fn prepare_query(search_sig: &Signature, template: &Sketch) -> Option<KmerMinHash> {
+    let mut search_mh = None;
+    if let Some(Sketch::MinHash(mh)) = search_sig.select_sketch(template) {
+        search_mh = Some(mh.clone());
+    } else {
+        // try to find one that can be downsampled
+        if let Sketch::MinHash(template_mh) = template {
+            for sketch in search_sig.sketches() {
+                if let Sketch::MinHash(ref_mh) = sketch {
+                    if check_compatible_downsample(&ref_mh, template_mh).is_ok() {
+                        let max_hash = max_hash_for_scaled(template_mh.scaled());
+                        let mh = ref_mh.downsample_max_hash(max_hash).unwrap();
+                        search_mh = Some(mh);
+                    }
+                }
+            }
+        }
+    }
+    search_mh
+}
+
 fn map_hashes_colors(
     db: Arc<DB>,
     dataset_id: DatasetID,
@@ -56,12 +109,9 @@ fn map_hashes_colors(
     template: &Sketch,
     //) -> Option<(HashToColor, Datasets)> {
 ) {
-    let mut search_mh = None;
-    if let Some(Sketch::MinHash(mh)) = search_sig.select_sketch(template) {
-        search_mh = Some(mh);
-    }
+    let search_mh =
+        prepare_query(search_sig, template).expect("Couldn't find a compatible MinHash");
 
-    let search_mh = search_mh.expect("Couldn't find a compatible MinHash");
     let colors = Datasets::new(&[dataset_id]).as_bytes().unwrap();
 
     let matched = search_mh.mins();
@@ -77,14 +127,6 @@ fn map_hashes_colors(
                 .expect("error merging");
         }
     }
-
-    /*
-        if hash_to_color.is_empty() {
-            None
-        } else {
-            Some((hash_to_color, colors))
-        }
-    */
 }
 
 fn counter_for_query(db: Arc<DB>, query: &KmerMinHash) -> SigCounter {
@@ -106,20 +148,6 @@ fn counter_for_query(db: Arc<DB>, query: &KmerMinHash) -> SigCounter {
             new_vals.0.into_iter()
         })
         .collect()
-    /*
-    info!("get");
-    hashes_iter
-        .into_iter()
-        .filter_map(|r| {
-            let datasets = db.get(&r).ok().unwrap();
-            datasets
-        })
-        .flat_map(|raw_datasets| {
-            let new_vals = Datasets::from_slice(&raw_datasets).unwrap();
-            new_vals.0.into_iter()
-        })
-        .collect()
-    */
 }
 
 #[derive(Default, Debug, PartialEq, Clone, Archive, Serialize, Deserialize)]
@@ -191,38 +219,6 @@ impl Colors {
         sorted.hash(&mut hasher);
         hasher.finish()
     }
-
-    /*
-    pub fn len(&self) -> usize {
-        self.colors.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.colors.is_empty()
-    }
-
-    pub fn contains(&self, color: Color, idx: DatasetID) -> bool {
-        if let Some(idxs) = self.colors.get(&color) {
-            idxs.0.contains(&idx)
-        } else {
-            false
-        }
-    }
-
-    pub fn indices(&self, color: &Color) -> Indices {
-        // TODO: what if color is not present?
-        Indices {
-            iter: self.colors.get(color).unwrap().0.iter(),
-        }
-    }
-
-    pub fn retain<F>(&mut self, f: F)
-    where
-        F: FnMut(&Color, &mut Datasets) -> bool,
-    {
-        self.colors.retain(f)
-    }
-    */
 }
 
 #[derive(Default, Debug, PartialEq, Clone, Archive, Serialize, Deserialize)]
@@ -284,7 +280,6 @@ fn index<P: AsRef<Path>>(
 
     let processed_sigs = AtomicUsize::new(0);
     let sig_iter = index_sigs.par_iter();
-    //let sig_iter = index_sigs.iter();
 
     let _filtered_sigs = sig_iter
         .enumerate()
@@ -315,25 +310,46 @@ fn index<P: AsRef<Path>>(
 
 fn check<P: AsRef<Path>>(output: P) -> Result<(), Box<dyn std::error::Error>> {
     use byteorder::ReadBytesExt;
+    use numsep::{separate, Locale};
 
     let db = open_db(output.as_ref(), true);
 
     let iter = db.iterator(rocksdb::IteratorMode::Start);
     let mut kcount = 0;
     let mut vcount = 0;
+    let mut vcounts = Histogram::new();
+    let mut datasets = HashSet::new();
+
     for (key, value) in iter {
         let _k = (&key[..]).read_u64::<LittleEndian>()?;
         kcount += key.len();
+
         //println!("Saw {} {:?}", k, Datasets::from_slice(&value));
-        let _v = Datasets::from_slice(&value).expect("Error with value");
+        let v = Datasets::from_slice(&value).expect("Error with value");
         vcount += value.len();
+        vcounts.increment(v.0.len() as u64).unwrap();
+        datasets = datasets.union(&v.0).cloned().collect();
         //println!("Saw {} {:?}", k, value);
     }
 
     use size::Size;
     let ksize = Size::from_bytes(kcount);
     let vsize = Size::from_bytes(vcount);
-    info!("k: {}, v: {}", ksize.to_string(), vsize.to_string());
+    info!(
+        "total datasets: {}",
+        separate(datasets.len(), Locale::English)
+    );
+    info!("total keys: {}", separate(kcount / 8, Locale::English));
+
+    info!("k: {}", ksize.to_string());
+    info!("v: {}", vsize.to_string());
+
+    info!("max v: {}", vcounts.maximum().unwrap());
+    info!("mean v: {}", vcounts.mean().unwrap());
+    info!("stddev: {}", vcounts.stddev().unwrap());
+    info!("median v: {}", vcounts.percentile(50.0).unwrap());
+    info!("p25 v: {}", vcounts.percentile(25.0).unwrap());
+    info!("p75 v: {}", vcounts.percentile(75.0).unwrap());
 
     Ok(())
 }
@@ -349,18 +365,17 @@ fn search<P: AsRef<Path>>(
     let mut threshold = usize::max_value();
 
     let query_sig = Signature::from_path(queries_file)?;
+
     let mut query = None;
     for sig in &query_sig {
-        if let Some(sketch) = sig.select_sketch(&template) {
-            if let Sketch::MinHash(mh) = sketch {
-                query = Some(mh.clone());
-                // TODO: deal with mh.size() == 0
-                let t = threshold_bp / (cmp::max(mh.size(), 1) * mh.scaled() as usize);
-                threshold = cmp::min(threshold, t);
-            }
+        if let Some(q) = prepare_query(sig, &template) {
+            query = Some(q);
         }
     }
-    let query = query.unwrap();
+    let query = query.expect("Couldn't find a compatible MinHash");
+
+    let t = threshold_bp / (cmp::max(query.size(), 1) * query.scaled() as usize);
+    threshold = cmp::min(threshold, t);
 
     info!("Loading siglist");
     let sig_files = read_paths(siglist)?;
@@ -381,7 +396,7 @@ fn search<P: AsRef<Path>>(
             break;
         };
     }
-    info!("{:?}", matches);
+    info!("matches: {}", matches.len());
 
     Ok(())
 }
