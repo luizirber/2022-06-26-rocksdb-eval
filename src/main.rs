@@ -1,7 +1,6 @@
 use std::cmp;
 use std::collections::HashSet;
 use std::fs::File;
-use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
 use std::io::BufRead;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -26,27 +25,21 @@ type DB = rocksdb::DBWithThreadMode<rocksdb::SingleThreaded>;
 type DatasetID = u64;
 type SigCounter = counter::Counter<DatasetID>;
 
-type Color = u64;
-
 fn merge_datasets(
     _: &[u8],
     existing_val: Option<&[u8]>,
     operands: &MergeOperands,
 ) -> Option<Vec<u8>> {
-    let original_datasets = existing_val
+    let mut datasets = existing_val
         .and_then(Datasets::from_slice)
         .unwrap_or_default();
-    let mut datasets = original_datasets.clone();
 
     for op in operands {
         let new_vals = Datasets::from_slice(op).unwrap();
-        datasets = Datasets(datasets.0.union(&new_vals.0).cloned().collect());
+        datasets.union(new_vals);
     }
-    //    if let Some(_) = datasets.0.difference(&original_datasets.0).next() {
+    // TODO: optimization! if nothing changed, skip as_bytes()
     datasets.as_bytes()
-    //    } else {
-    //        None
-    //    }
 }
 
 fn check_compatible_downsample(
@@ -145,10 +138,14 @@ fn counter_for_query(db: Arc<DB>, query: &KmerMinHash) -> SigCounter {
         .filter_map(|r| r.ok().unwrap())
         .flat_map(|raw_datasets| {
             let new_vals = Datasets::from_slice(&raw_datasets).unwrap();
-            new_vals.0.into_iter()
+            new_vals.into_iter()
         })
         .collect()
 }
+
+/*
+use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
+type Color = u64;
 
 #[derive(Default, Debug, PartialEq, Clone, Archive, Serialize, Deserialize)]
 pub struct Colors;
@@ -220,13 +217,43 @@ impl Colors {
         hasher.finish()
     }
 }
+*/
 
-#[derive(Default, Debug, PartialEq, Clone, Archive, Serialize, Deserialize)]
-struct Datasets(HashSet<DatasetID>);
+#[derive(Debug, PartialEq, Clone, Archive, Serialize, Deserialize)]
+enum Datasets {
+    Empty,
+    Unique(DatasetID),
+    Many(HashSet<DatasetID>),
+}
+
+impl IntoIterator for Datasets {
+    type Item = DatasetID;
+    type IntoIter = Box<dyn Iterator<Item = Self::Item>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        match self {
+            Self::Empty => Box::new(std::iter::empty()),
+            Self::Unique(v) => Box::new(std::iter::once(v)),
+            Self::Many(v) => Box::new(v.into_iter()),
+        }
+    }
+}
+
+impl Default for Datasets {
+    fn default() -> Self {
+        Datasets::Empty
+    }
+}
 
 impl Datasets {
     fn new(vals: &[DatasetID]) -> Self {
-        Self(HashSet::from_iter(vals.into_iter().cloned()))
+        if vals.len() == 0 {
+            Self::Empty
+        } else if vals.len() == 1 {
+            Self::Unique(vals[0])
+        } else {
+            Self::Many(HashSet::from_iter(vals.into_iter().cloned()))
+        }
     }
 
     fn from_slice(slice: &[u8]) -> Option<Self> {
@@ -250,6 +277,36 @@ impl Datasets {
         debug_assert!(Datasets::from_slice(&buf.to_vec()).is_some());
         Some(buf.to_vec())
         */
+    }
+
+    fn union(&mut self, other: Datasets) {
+        match self {
+            Datasets::Empty => match other {
+                Datasets::Empty => (),
+                Datasets::Unique(_) | Datasets::Many(_) => *self = other,
+            },
+            Datasets::Unique(v) => match other {
+                Datasets::Empty => (),
+                Datasets::Unique(o) => {
+                    if *v != o {
+                        *self = Datasets::Many([*v, o].into_iter().collect())
+                    }
+                }
+                Datasets::Many(o) => {
+                    let mut new_hashset: HashSet<DatasetID> = [*v].into_iter().collect();
+                    new_hashset.extend(o.into_iter());
+                    *self = Datasets::Many(new_hashset);
+                }
+            },
+            Datasets::Many(ref mut v) => v.extend(other.into_iter()),
+        }
+    }
+    fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Unique(_) => 1,
+            Self::Many(ref v) => v.len(),
+        }
     }
 }
 
@@ -318,7 +375,7 @@ fn check<P: AsRef<Path>>(output: P) -> Result<(), Box<dyn std::error::Error>> {
     let mut kcount = 0;
     let mut vcount = 0;
     let mut vcounts = Histogram::new();
-    let mut datasets = HashSet::new();
+    let mut datasets: Datasets = Default::default();
 
     for (key, value) in iter {
         let _k = (&key[..]).read_u64::<LittleEndian>()?;
@@ -327,8 +384,8 @@ fn check<P: AsRef<Path>>(output: P) -> Result<(), Box<dyn std::error::Error>> {
         //println!("Saw {} {:?}", k, Datasets::from_slice(&value));
         let v = Datasets::from_slice(&value).expect("Error with value");
         vcount += value.len();
-        vcounts.increment(v.0.len() as u64).unwrap();
-        datasets = datasets.union(&v.0).cloned().collect();
+        vcounts.increment(v.len() as u64).unwrap();
+        datasets.union(v);
         //println!("Saw {} {:?}", k, value);
     }
 
