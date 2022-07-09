@@ -1029,7 +1029,7 @@ checksum = "9f1341053f34bb13b5e9590afb7d94b48b48d4b87467ec28e3c238693bb553de"
 [[package]]
 name = "sourmash"
 version = "0.11.0"
-source = "git+https://github.com/sourmash-bio/sourmash?tag=v4.4.0#851dc2b1dc215ef59f0b5a81d67900329690aa91"
+source = "git+https://github.com/sourmash-bio/sourmash?branch=lirber/rkyv_mh#bc4ae736ce906ec736528d32ea29dcfd2f817d29"
 dependencies = [
  "az",
  "bytecount",
@@ -1049,6 +1049,7 @@ dependencies = [
  "ouroboros",
  "piz",
  "primal-check",
+ "rkyv",
  "serde",
  "serde_json",
  "thiserror",

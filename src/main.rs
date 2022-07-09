@@ -135,7 +135,7 @@ fn counter_for_query(db: Arc<DB>, query: &KmerMinHash) -> SigCounter {
     info!("Multi get");
     db.multi_get(hashes_iter)
         .into_iter()
-        .filter_map(|r| r.ok().unwrap())
+        .filter_map(|r| r.ok().unwrap_or(None))
         .flat_map(|raw_datasets| {
             let new_vals = Datasets::from_slice(&raw_datasets).unwrap();
             new_vals.into_iter()
@@ -313,6 +313,7 @@ impl Datasets {
 fn open_db(path: &Path, read_only: bool) -> Arc<DB> {
     let mut opts = Options::default();
     opts.create_if_missing(true);
+    opts.set_max_open_files(1000);
     opts.set_merge_operator_associative("datasets operator", merge_datasets);
     //opts.set_compaction_style(DBCompactionStyle::Universal);
     //opts.set_min_write_buffer_number_to_merge(10);
@@ -365,7 +366,7 @@ fn index<P: AsRef<Path>>(
     Ok(())
 }
 
-fn check<P: AsRef<Path>>(output: P) -> Result<(), Box<dyn std::error::Error>> {
+fn check<P: AsRef<Path>>(output: P, quick: bool) -> Result<(), Box<dyn std::error::Error>> {
     use byteorder::ReadBytesExt;
     use numsep::{separate, Locale};
 
@@ -382,31 +383,38 @@ fn check<P: AsRef<Path>>(output: P) -> Result<(), Box<dyn std::error::Error>> {
         kcount += key.len();
 
         //println!("Saw {} {:?}", k, Datasets::from_slice(&value));
-        let v = Datasets::from_slice(&value).expect("Error with value");
         vcount += value.len();
-        vcounts.increment(v.len() as u64).unwrap();
-        datasets.union(v);
+
+        if !quick {
+            let v = Datasets::from_slice(&value).expect("Error with value");
+            vcounts.increment(v.len() as u64).unwrap();
+            datasets.union(v);
+        }
         //println!("Saw {} {:?}", k, value);
     }
 
     use size::Size;
     let ksize = Size::from_bytes(kcount);
     let vsize = Size::from_bytes(vcount);
-    info!(
-        "total datasets: {}",
-        separate(datasets.len(), Locale::English)
-    );
+    if quick {
+        info!(
+            "total datasets: {}",
+            separate(datasets.len(), Locale::English)
+        );
+    }
     info!("total keys: {}", separate(kcount / 8, Locale::English));
 
     info!("k: {}", ksize.to_string());
     info!("v: {}", vsize.to_string());
 
-    info!("max v: {}", vcounts.maximum().unwrap());
-    info!("mean v: {}", vcounts.mean().unwrap());
-    info!("stddev: {}", vcounts.stddev().unwrap());
-    info!("median v: {}", vcounts.percentile(50.0).unwrap());
-    info!("p25 v: {}", vcounts.percentile(25.0).unwrap());
-    info!("p75 v: {}", vcounts.percentile(75.0).unwrap());
+    if !quick {
+        info!("max v: {}", vcounts.maximum().unwrap());
+        info!("mean v: {}", vcounts.mean().unwrap());
+        info!("stddev: {}", vcounts.stddev().unwrap());
+        info!("median v: {}", vcounts.percentile(50.0).unwrap());
+        info!("p25 v: {}", vcounts.percentile(25.0).unwrap());
+        info!("p75 v: {}", vcounts.percentile(75.0).unwrap());
+    }
 
     Ok(())
 }
@@ -514,6 +522,10 @@ enum Commands {
         /// The path for output
         #[clap(parse(from_os_str), short, long)]
         output: PathBuf,
+
+        /// avoid deserializing data, and without stats
+        #[clap(long = "quick")]
+        quick: bool,
     },
     Search {
         /// Query signature
@@ -564,7 +576,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             index(siglist, template, threshold, output)?
         }
-        Check { output } => check(output)?,
+        Check { output, quick } => check(output, quick)?,
         Search {
             query_path,
             output,
