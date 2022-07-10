@@ -1,4 +1,3 @@
-use std::cmp;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::BufRead;
@@ -349,6 +348,7 @@ fn open_db(path: &Path, read_only: bool) -> Arc<DB> {
     block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
     block_opts.set_format_version(5);
     opts.set_block_based_table_factory(&block_opts);
+    // End of updated defaults
 
     if !read_only {
         opts.create_if_missing(true);
@@ -372,7 +372,7 @@ fn cf_descriptors() -> Vec<ColumnFamilyDescriptor> {
     cfopts.set_merge_operator_associative("datasets operator", merge_datasets);
     cfopts.set_min_write_buffer_number_to_merge(10);
 
-    // Updated defaults from
+    // Updated default from
     // https://github.com/facebook/rocksdb/wiki/Setup-Options-and-Basic-Tuning#other-general-options
     cfopts.set_level_compaction_dynamic_level_bytes(true);
 
@@ -382,6 +382,9 @@ fn cf_descriptors() -> Vec<ColumnFamilyDescriptor> {
 
     let mut cfopts = Options::default();
     cfopts.set_max_write_buffer_number(16);
+    // Updated default
+    cfopts.set_level_compaction_dynamic_level_bytes(true);
+
     let cf_sigs = ColumnFamilyDescriptor::new(SIGS, cfopts);
 
     vec![cf_hashes, cf_sigs]
@@ -498,10 +501,8 @@ fn search<P: AsRef<Path>>(
     index: P,
     template: Sketch,
     threshold_bp: usize,
-    output: Option<P>,
+    _output: Option<P>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut threshold = usize::max_value();
-
     let query_sig = Signature::from_path(queries_file)?;
 
     let mut query = None;
@@ -512,8 +513,7 @@ fn search<P: AsRef<Path>>(
     }
     let query = query.expect("Couldn't find a compatible MinHash");
 
-    let t = threshold_bp / (cmp::max(query.size(), 1) * query.scaled() as usize);
-    threshold = cmp::min(threshold, t);
+    let threshold = threshold_bp / query.scaled() as usize;
 
     info!("Loading siglist");
     let sig_files = read_paths(siglist)?;
@@ -580,7 +580,7 @@ enum Commands {
         ksize: u8,
 
         /// threshold
-        #[clap(short, long, default_value = "0.85")]
+        #[clap(short, long, default_value = "0")]
         threshold: f64,
 
         /// scaled
