@@ -13,17 +13,21 @@ use histogram::Histogram;
 use log::info;
 use rayon::prelude::*;
 use rkyv::{Archive, Deserialize, Serialize};
-use rocksdb::{MergeOperands, Options};
+use rocksdb::{ColumnFamilyDescriptor, MergeOperands, Options};
 
 use sourmash::signature::{Signature, SigsTrait};
 use sourmash::sketch::minhash::{max_hash_for_scaled, KmerMinHash};
 use sourmash::sketch::Sketch;
 
-type DB = rocksdb::DBWithThreadMode<rocksdb::SingleThreaded>;
-//type DB = rocksdb::DBWithThreadMode<rocksdb::MultiThreaded>;
+//type DB = rocksdb::DBWithThreadMode<rocksdb::SingleThreaded>;
+type DB = rocksdb::DBWithThreadMode<rocksdb::MultiThreaded>;
 
 type DatasetID = u64;
 type SigCounter = counter::Counter<DatasetID>;
+
+const HASHES: &str = "hashes";
+//const COLORS: &str = "colors";
+const SIGS: &str = "signatures";
 
 fn merge_datasets(
     _: &[u8],
@@ -97,15 +101,17 @@ fn prepare_query(search_sig: &Signature, template: &Sketch) -> Option<KmerMinHas
 fn map_hashes_colors(
     db: Arc<DB>,
     dataset_id: DatasetID,
-    search_sig: &Signature,
+    mut search_sig: Signature,
     threshold: f64,
     template: &Sketch,
     //) -> Option<(HashToColor, Datasets)> {
 ) {
     let search_mh =
-        prepare_query(search_sig, template).expect("Couldn't find a compatible MinHash");
+        prepare_query(&search_sig, template).expect("Couldn't find a compatible MinHash");
 
     let colors = Datasets::new(&[dataset_id]).as_bytes().unwrap();
+
+    let cf_hashes = db.cf_handle(HASHES).unwrap();
 
     let matched = search_mh.mins();
     let size = matched.len() as u64;
@@ -116,24 +122,44 @@ fn map_hashes_colors(
             (&mut hash_bytes[..])
                 .write_u64::<LittleEndian>(hash)
                 .expect("error writing bytes");
-            db.merge(&hash_bytes[..], colors.as_slice())
+            db.merge_cf(&cf_hashes, &hash_bytes[..], colors.as_slice())
                 .expect("error merging");
         }
     }
+
+    // Save signature to DB
+    search_sig.reset_sketches();
+    search_sig.push(Sketch::MinHash(search_mh));
+    let sig_bytes = rkyv::to_bytes::<_, 256>(&search_sig).unwrap().into_vec();
+    /*
+    use rkyv::ser::Serializer;
+    let mut serializer = rkyv::ser::serializers::AlignedSerializer::new(rkyv::AlignedVec::new());
+    serializer.serialize_value(&search_sig).unwrap();
+    let sig_bytes = serializer.into_inner();
+        */
+
+    let cf_sigs = db.cf_handle(SIGS).unwrap();
+    let mut hash_bytes = [0u8; 8];
+    (&mut hash_bytes[..])
+        .write_u64::<LittleEndian>(dataset_id)
+        .expect("error writing bytes");
+    db.put_cf(&cf_sigs, &hash_bytes[..], sig_bytes.as_slice())
+        .expect("error saving sig");
 }
 
 fn counter_for_query(db: Arc<DB>, query: &KmerMinHash) -> SigCounter {
     info!("Collecting hashes");
+    let cf_hashes = db.cf_handle(HASHES).unwrap();
     let hashes_iter = query.iter_mins().map(|hash| {
         let mut v = vec![0_u8; 8];
         (&mut v[..])
             .write_u64::<LittleEndian>(*hash)
             .expect("error writing bytes");
-        v
+        (&cf_hashes, v)
     });
 
     info!("Multi get");
-    db.multi_get(hashes_iter)
+    db.multi_get_cf(hashes_iter)
         .into_iter()
         .filter_map(|r| r.ok().unwrap_or(None))
         .flat_map(|raw_datasets| {
@@ -312,16 +338,53 @@ impl Datasets {
 
 fn open_db(path: &Path, read_only: bool) -> Arc<DB> {
     let mut opts = Options::default();
-    opts.create_if_missing(true);
     opts.set_max_open_files(1000);
-    opts.set_merge_operator_associative("datasets operator", merge_datasets);
-    //opts.set_compaction_style(DBCompactionStyle::Universal);
-    //opts.set_min_write_buffer_number_to_merge(10);
-    if read_only {
-        Arc::new(DB::open_for_read_only(&opts, path, true).unwrap())
-    } else {
-        Arc::new(DB::open(&opts, path).unwrap())
+
+    // Updated defaults from
+    // https://github.com/facebook/rocksdb/wiki/Setup-Options-and-Basic-Tuning#other-general-options
+    opts.set_bytes_per_sync(1048576);
+    let mut block_opts = rocksdb::BlockBasedOptions::default();
+    block_opts.set_block_size(16 * 1024);
+    block_opts.set_cache_index_and_filter_blocks(true);
+    block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
+    block_opts.set_format_version(5);
+    opts.set_block_based_table_factory(&block_opts);
+
+    if !read_only {
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
     }
+
+    // prepare column family descriptors
+    let cfs = cf_descriptors();
+
+    if read_only {
+        //TODO: error_if_log_file_exists set to false, is that an issue?
+        Arc::new(DB::open_cf_descriptors_read_only(&opts, path, cfs, false).unwrap())
+    } else {
+        Arc::new(DB::open_cf_descriptors(&opts, path, cfs).unwrap())
+    }
+}
+
+fn cf_descriptors() -> Vec<ColumnFamilyDescriptor> {
+    let mut cfopts = Options::default();
+    cfopts.set_max_write_buffer_number(16);
+    cfopts.set_merge_operator_associative("datasets operator", merge_datasets);
+    cfopts.set_min_write_buffer_number_to_merge(10);
+
+    // Updated defaults from
+    // https://github.com/facebook/rocksdb/wiki/Setup-Options-and-Basic-Tuning#other-general-options
+    cfopts.set_level_compaction_dynamic_level_bytes(true);
+
+    let cf_hashes = ColumnFamilyDescriptor::new(HASHES, cfopts);
+
+    //let cf_colors = ColumnFamilyDescriptor::new(COLORS, cfopts);
+
+    let mut cfopts = Options::default();
+    cfopts.set_max_write_buffer_number(16);
+    let cf_sigs = ColumnFamilyDescriptor::new(SIGS, cfopts);
+
+    vec![cf_hashes, cf_sigs]
 }
 
 fn index<P: AsRef<Path>>(
@@ -354,7 +417,7 @@ fn index<P: AsRef<Path>>(
             map_hashes_colors(
                 db.clone(),
                 dataset_id as DatasetID,
-                &search_sig,
+                search_sig,
                 threshold,
                 &template,
             );
@@ -363,6 +426,7 @@ fn index<P: AsRef<Path>>(
         .count();
 
     info!("Processed {} reference sigs", processed_sigs.into_inner());
+
     Ok(())
 }
 
@@ -372,49 +436,58 @@ fn check<P: AsRef<Path>>(output: P, quick: bool) -> Result<(), Box<dyn std::erro
 
     let db = open_db(output.as_ref(), true);
 
-    let iter = db.iterator(rocksdb::IteratorMode::Start);
-    let mut kcount = 0;
-    let mut vcount = 0;
-    let mut vcounts = Histogram::new();
-    let mut datasets: Datasets = Default::default();
+    let stats_for_cf = |cf_name| {
+        let cf = db.cf_handle(cf_name).unwrap();
 
-    for (key, value) in iter {
-        let _k = (&key[..]).read_u64::<LittleEndian>()?;
-        kcount += key.len();
+        let iter = db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        let mut kcount = 0;
+        let mut vcount = 0;
+        let mut vcounts = Histogram::new();
+        let mut datasets: Datasets = Default::default();
 
-        //println!("Saw {} {:?}", k, Datasets::from_slice(&value));
-        vcount += value.len();
+        for (key, value) in iter {
+            let _k = (&key[..]).read_u64::<LittleEndian>().unwrap();
+            kcount += key.len();
 
-        if !quick {
-            let v = Datasets::from_slice(&value).expect("Error with value");
-            vcounts.increment(v.len() as u64).unwrap();
-            datasets.union(v);
+            //println!("Saw {} {:?}", k, Datasets::from_slice(&value));
+            vcount += value.len();
+
+            if !quick && cf_name == HASHES {
+                let v = Datasets::from_slice(&value).expect("Error with value");
+                vcounts.increment(v.len() as u64).unwrap();
+                datasets.union(v);
+            }
+            //println!("Saw {} {:?}", k, value);
         }
-        //println!("Saw {} {:?}", k, value);
-    }
 
-    use size::Size;
-    let ksize = Size::from_bytes(kcount);
-    let vsize = Size::from_bytes(vcount);
-    if quick {
-        info!(
-            "total datasets: {}",
-            separate(datasets.len(), Locale::English)
-        );
-    }
-    info!("total keys: {}", separate(kcount / 8, Locale::English));
+        info!("*** {} ***", cf_name);
+        use size::Size;
+        let ksize = Size::from_bytes(kcount);
+        let vsize = Size::from_bytes(vcount);
+        if !quick && cf_name == HASHES {
+            info!(
+                "total datasets: {}",
+                separate(datasets.len(), Locale::English)
+            );
+        }
+        info!("total keys: {}", separate(kcount / 8, Locale::English));
 
-    info!("k: {}", ksize.to_string());
-    info!("v: {}", vsize.to_string());
+        info!("k: {}", ksize.to_string());
+        info!("v: {}", vsize.to_string());
 
-    if !quick {
-        info!("max v: {}", vcounts.maximum().unwrap());
-        info!("mean v: {}", vcounts.mean().unwrap());
-        info!("stddev: {}", vcounts.stddev().unwrap());
-        info!("median v: {}", vcounts.percentile(50.0).unwrap());
-        info!("p25 v: {}", vcounts.percentile(25.0).unwrap());
-        info!("p75 v: {}", vcounts.percentile(75.0).unwrap());
-    }
+        if !quick && kcount > 0 && cf_name == HASHES {
+            info!("max v: {}", vcounts.maximum().unwrap());
+            info!("mean v: {}", vcounts.mean().unwrap());
+            info!("stddev: {}", vcounts.stddev().unwrap());
+            info!("median v: {}", vcounts.percentile(50.0).unwrap());
+            info!("p25 v: {}", vcounts.percentile(25.0).unwrap());
+            info!("p75 v: {}", vcounts.percentile(75.0).unwrap());
+        }
+    };
+
+    stats_for_cf(HASHES);
+    info!("");
+    stats_for_cf(SIGS);
 
     Ok(())
 }
@@ -520,7 +593,7 @@ enum Commands {
     },
     Check {
         /// The path for output
-        #[clap(parse(from_os_str), short, long)]
+        #[clap(parse(from_os_str))]
         output: PathBuf,
 
         /// avoid deserializing data, and without stats
