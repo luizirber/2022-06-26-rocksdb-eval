@@ -100,11 +100,16 @@ fn prepare_query(search_sig: &Signature, template: &Sketch) -> Option<KmerMinHas
 fn map_hashes_colors(
     db: Arc<DB>,
     dataset_id: DatasetID,
-    mut search_sig: Signature,
+    filename: &PathBuf,
     threshold: f64,
     template: &Sketch,
+    save_paths: bool,
     //) -> Option<(HashToColor, Datasets)> {
 ) {
+    let mut search_sig = Signature::from_path(&filename)
+        .unwrap_or_else(|_| panic!("Error processing {:?}", filename))
+        .swap_remove(0);
+
     let search_mh =
         prepare_query(&search_sig, template).expect("Couldn't find a compatible MinHash");
 
@@ -127,16 +132,17 @@ fn map_hashes_colors(
     }
 
     // Save signature to DB
-    search_sig.reset_sketches();
-    search_sig.push(Sketch::MinHash(search_mh));
-    let sig_bytes = rkyv::to_bytes::<_, 256>(&search_sig).unwrap().into_vec();
-    /*
-    use rkyv::ser::Serializer;
-    let mut serializer = rkyv::ser::serializers::AlignedSerializer::new(rkyv::AlignedVec::new());
-    serializer.serialize_value(&search_sig).unwrap();
-    let sig_bytes = serializer.into_inner();
-        */
+    let sig = if search_mh.is_empty() || size < threshold as u64 {
+        SignatureData::Empty
+    } else if save_paths {
+        SignatureData::External(filename.to_str().unwrap().to_string())
+    } else {
+        search_sig.reset_sketches();
+        search_sig.push(Sketch::MinHash(search_mh));
+        SignatureData::Internal(search_sig)
+    };
 
+    let sig_bytes = sig.as_bytes().unwrap();
     let cf_sigs = db.cf_handle(SIGS).unwrap();
     let mut hash_bytes = [0u8; 8];
     (&mut hash_bytes[..])
@@ -243,6 +249,44 @@ impl Colors {
     }
 }
 */
+
+#[derive(Debug, PartialEq, Clone, Archive, Serialize, Deserialize)]
+enum SignatureData {
+    Empty,
+    Internal(Signature),
+    External(String),
+}
+
+impl Default for SignatureData {
+    fn default() -> Self {
+        SignatureData::Empty
+    }
+}
+
+impl SignatureData {
+    fn from_slice(slice: &[u8]) -> Option<Self> {
+        // TODO: avoid the aligned vec allocation here
+        let mut vec = rkyv::AlignedVec::new();
+        vec.extend_from_slice(slice);
+        let archived_value = unsafe { rkyv::archived_root::<Self>(vec.as_ref()) };
+        let inner = archived_value.deserialize(&mut rkyv::Infallible).unwrap();
+        Some(inner)
+    }
+
+    fn as_bytes(&self) -> Option<Vec<u8>> {
+        let bytes = rkyv::to_bytes::<_, 256>(self).unwrap();
+        Some(bytes.into_vec())
+
+        /*
+        let mut serializer = DefaultSerializer::default();
+        let v = serializer.serialize_value(self).unwrap();
+        debug_assert_eq!(v, 0);
+        let buf = serializer.into_serializer().into_inner();
+        debug_assert!(Datasets::from_slice(&buf.to_vec()).is_some());
+        Some(buf.to_vec())
+        */
+    }
+}
 
 #[derive(Debug, PartialEq, Clone, Archive, Serialize, Deserialize)]
 enum Datasets {
@@ -395,6 +439,7 @@ fn index<P: AsRef<Path>>(
     template: Sketch,
     threshold: f64,
     output: P,
+    save_paths: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("Loading siglist");
     let index_sigs = read_paths(siglist)?;
@@ -413,16 +458,13 @@ fn index<P: AsRef<Path>>(
                 info!("Processed {} reference sigs", i);
             }
 
-            let search_sig = Signature::from_path(&filename)
-                .unwrap_or_else(|_| panic!("Error processing {:?}", filename))
-                .swap_remove(0);
-
             map_hashes_colors(
                 db.clone(),
                 dataset_id as DatasetID,
-                search_sig,
+                filename,
                 threshold,
                 &template,
+                save_paths,
             );
             Some(true)
         })
@@ -497,7 +539,6 @@ fn check<P: AsRef<Path>>(output: P, quick: bool) -> Result<(), Box<dyn std::erro
 
 fn search<P: AsRef<Path>>(
     queries_file: P,
-    siglist: P,
     index: P,
     template: Sketch,
     threshold_bp: usize,
@@ -515,26 +556,46 @@ fn search<P: AsRef<Path>>(
 
     let threshold = threshold_bp / query.scaled() as usize;
 
-    info!("Loading siglist");
-    let sig_files = read_paths(siglist)?;
-    info!("Loaded {} sig paths in siglist", sig_files.len());
-
     let db = open_db(index.as_ref(), true);
     info!("Loaded DB");
 
     info!("Building counter");
-    let counter = counter_for_query(db, &query);
+    let counter = counter_for_query(db.clone(), &query);
     info!("Counter built");
 
-    let mut matches: Vec<String> = vec![];
-    for (dataset_id, size) in counter.most_common() {
-        if size >= threshold {
-            matches.push(sig_files[dataset_id as usize].to_str().unwrap().into());
-        } else {
-            break;
-        };
-    }
+    let cf_sigs = db.cf_handle(SIGS).unwrap();
+
+    let matches_iter = counter
+        .most_common()
+        .into_iter()
+        .filter_map(|(dataset_id, size)| {
+            if size >= threshold {
+                let mut v = vec![0_u8; 8];
+                (&mut v[..])
+                    .write_u64::<LittleEndian>(dataset_id)
+                    .expect("error writing bytes");
+                Some((&cf_sigs, v))
+            } else {
+                None
+            }
+        });
+
+    info!("Multi get");
+    let matches: Vec<String> = db
+        .multi_get_cf(matches_iter)
+        .into_iter()
+        .filter_map(|r| r.ok().unwrap_or(None))
+        .filter_map(
+            |sigdata| match SignatureData::from_slice(&sigdata).unwrap() {
+                SignatureData::Empty => None,
+                SignatureData::External(p) => Some(p),
+                SignatureData::Internal(sig) => Some(sig.name()),
+            },
+        )
+        .collect();
+
     info!("matches: {}", matches.len());
+    //info!("matches: {:?}", matches);
 
     Ok(())
 }
@@ -587,6 +648,10 @@ enum Commands {
         #[clap(short, long, default_value = "1000")]
         scaled: usize,
 
+        /// save paths to signatures into index. Default: save full sig into index
+        #[clap(long)]
+        save_paths: bool,
+
         /// The path for output
         #[clap(parse(from_os_str), short, long)]
         output: PathBuf,
@@ -605,11 +670,7 @@ enum Commands {
         #[clap(parse(from_os_str))]
         query_path: PathBuf,
 
-        /// Precomputed index or list of reference signatures
-        #[clap(parse(from_os_str))]
-        siglist: PathBuf,
-
-        /// Precomputed index or list of reference signatures
+        /// Path to rocksdb index dir
         #[clap(parse(from_os_str))]
         index: PathBuf,
 
@@ -644,16 +705,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             threshold,
             ksize,
             scaled,
+            save_paths,
         } => {
             let template = build_template(ksize, scaled);
 
-            index(siglist, template, threshold, output)?
+            index(siglist, template, threshold, output, save_paths)?
         }
         Check { output, quick } => check(output, quick)?,
         Search {
             query_path,
             output,
-            siglist,
             index,
             threshold_bp,
             ksize,
@@ -661,7 +722,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let template = build_template(ksize, scaled);
 
-            search(query_path, siglist, index, template, threshold_bp, output)?
+            search(query_path, index, template, threshold_bp, output)?
         }
     };
 
