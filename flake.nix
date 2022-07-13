@@ -118,15 +118,8 @@
 
             git
             stdenv.cc.cc.lib
-            (python310.withPackages (ps: with ps; [ virtualenv tox setuptools ]))
-            (python39.withPackages (ps: with ps; [ virtualenv setuptools ]))
-            (python38.withPackages (ps: with ps; [ virtualenv setuptools ]))
 
             rust-cbindgen
-
-            wasmtime
-            wasm-pack
-            nodejs-16_x
 
             py-spy
             heaptrack
@@ -139,6 +132,8 @@
             llvmPackages_13.libclang
             llvmPackages_13.libcxxClang
             llvmPackages_13.lldb
+
+            snakemake
           ];
 
           BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${llvmPackages_13.libclang.lib}/lib/clang/${lib.getVersion clang}/include";
