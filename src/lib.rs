@@ -309,7 +309,7 @@ pub fn search<P: AsRef<Path>>(
 
     let threshold = threshold_bp / query.scaled() as usize;
 
-    let db = open_db(index.as_ref(), true, true);
+    let db = open_db(index.as_ref(), true, colors);
     info!("Loaded DB");
 
     info!("Building counter");
@@ -337,7 +337,7 @@ pub fn search<P: AsRef<Path>>(
             }
         });
 
-    info!("Multi get");
+    info!("Multi get matches");
     let matches: Vec<String> = db
         .multi_get_cf(matches_iter)
         .into_iter()
@@ -368,7 +368,7 @@ pub fn index<P: AsRef<Path>>(
     let index_sigs = read_paths(siglist)?;
     info!("Loaded {} sig paths in siglist", index_sigs.len());
 
-    let db = open_db(output.as_ref(), false, false);
+    let db = open_db(output.as_ref(), false, colors);
 
     let processed_sigs = AtomicUsize::new(0);
 
@@ -382,7 +382,7 @@ pub fn index<P: AsRef<Path>>(
                     info!("Processed {} reference sigs", i);
                 }
 
-                revindex::map_hashes_colors(
+                color_revindex::map_hashes_colors(
                     db.clone(),
                     dataset_id as DatasetID,
                     filename,
@@ -417,6 +417,15 @@ pub fn index<P: AsRef<Path>>(
     };
 
     info!("Processed {} reference sigs", processed_sigs.into_inner());
+
+    if colors {
+        use crate::color_revindex::Colors;
+
+        info!("Compressing colors");
+        Colors::compress(db.clone());
+        info!("Finished compressing colors");
+    }
+    db.compact_range(None::<&[u8]>, None::<&[u8]>);
 
     Ok(())
 }

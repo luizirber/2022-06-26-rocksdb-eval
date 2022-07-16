@@ -45,14 +45,14 @@ pub fn map_hashes_colors(
     template: &Sketch,
     save_paths: bool,
 ) {
+    use byteorder::ReadBytesExt;
+
     let search_sig = Signature::from_path(&filename)
         .unwrap_or_else(|_| panic!("Error processing {:?}", filename))
         .swap_remove(0);
 
     let search_mh =
         prepare_query(&search_sig, template).expect("Couldn't find a compatible MinHash");
-
-    let colors = Datasets::new(&[dataset_id]).as_bytes().unwrap();
 
     let cf_hashes = db.cf_handle(HASHES).unwrap();
 
@@ -61,14 +61,26 @@ pub fn map_hashes_colors(
     if !matched.is_empty() || size > threshold as u64 {
         // FIXME threshold is f64
         let mut hash_bytes = [0u8; 8];
+        let mut color_bytes = [0u8; 8];
         for hash in matched {
             (&mut hash_bytes[..])
                 .write_u64::<LittleEndian>(hash)
                 .expect("error writing bytes");
 
-            //TODO: choose color
+            let current_color = if let Ok(Some(c)) = db.get_cf(&cf_hashes, &hash_bytes[..]) {
+                Some((&c[..]).read_u64::<LittleEndian>().unwrap())
+            } else {
+                None
+            };
 
-            db.put_cf(&cf_hashes, &hash_bytes[..], colors.as_slice())
+            let new_color =
+                Colors::update(db.clone(), current_color, &[dataset_id as DatasetID]).unwrap();
+
+            (&mut color_bytes[..])
+                .write_u64::<LittleEndian>(new_color)
+                .expect("error writing bytes");
+
+            db.put_cf(&cf_hashes, &hash_bytes[..], &color_bytes[..])
                 .expect("error merging");
         }
     }
@@ -96,12 +108,19 @@ pub fn counter_for_query(db: Arc<DB>, query: &KmerMinHash) -> SigCounter {
         (&cf_hashes, v)
     });
 
-    info!("Multi get");
-    db.multi_get_cf(hashes_iter)
+    info!("Multi get hashes");
+    let cf_colors = db.cf_handle(COLORS).unwrap();
+    let colors_iter = db
+        .multi_get_cf(hashes_iter)
+        .into_iter()
+        .filter_map(|r| r.ok().unwrap_or(None).map(|color| (&cf_colors, color)));
+
+    info!("Multi get colors");
+    db.multi_get_cf(colors_iter)
         .into_iter()
         .filter_map(|r| r.ok().unwrap_or(None))
-        .flat_map(|raw_datasets| {
-            let new_vals = Datasets::from_slice(&raw_datasets).unwrap();
+        .flat_map(|datasets| {
+            let new_vals = Datasets::from_slice(&datasets).unwrap();
             new_vals.into_iter()
         })
         .collect()
@@ -157,17 +176,33 @@ impl Colors {
                     idxs.extend(idx_to_add.into_iter().cloned());
                     let new_color = Colors::compute_color(&idxs);
 
-                    // TODO: deal with collisions?
-                    db.put_cf(
-                        &cf_colors,
-                        &color_bytes[..],
-                        idxs.as_bytes().expect("Error converting color"),
-                    )
-                    .expect("error merging color");
+                    (&mut color_bytes[..])
+                        .write_u64::<LittleEndian>(new_color)
+                        .expect("error writing bytes");
+
+                    if matches!(db.get_cf(&cf_colors, &color_bytes)?, None) {
+                        // The color doesn't exist yet, so let's add it
+
+                        // TODO: deal with collisions?
+                        db.put_cf(
+                            &cf_colors,
+                            &color_bytes[..],
+                            idxs.as_bytes().expect("Error converting color"),
+                        )
+                        .expect("error merging color");
+                    }
 
                     Ok(new_color)
                 }
             } else {
+                use byteorder::ReadBytesExt;
+
+                let iter = db.iterator_cf(&cf_colors, rocksdb::IteratorMode::Start);
+                for (key, value) in iter {
+                    let k = (&key[..]).read_u64::<LittleEndian>().unwrap();
+                    let v = Datasets::from_slice(&value).expect("Error with value");
+                    dbg!((k, v));
+                }
                 unimplemented!("throw error, current_color must exist in order to be updated. current_color: {:?}", current_color);
             }
         } else {
@@ -201,6 +236,29 @@ impl Colors {
         */
         idxs.hash(&mut hasher);
         hasher.finish()
+    }
+
+    pub fn compress(db: Arc<DB>) {
+        use byteorder::ReadBytesExt;
+
+        let cf_colors = db.cf_handle(COLORS).unwrap();
+        let cf_hashes = db.cf_handle(HASHES).unwrap();
+
+        let mut colors: std::collections::HashSet<Color> = Default::default();
+
+        let iter = db.iterator_cf(&cf_hashes, rocksdb::IteratorMode::Start);
+        for (_, value) in iter {
+            let color = (&value[..]).read_u64::<LittleEndian>().unwrap();
+            colors.insert(color);
+        }
+
+        let iter = db.iterator_cf(&cf_colors, rocksdb::IteratorMode::Start);
+        for (key, _) in iter {
+            let k = (&key[..]).read_u64::<LittleEndian>().unwrap();
+            if !colors.contains(&k) {
+                db.delete_cf(&cf_colors, &key[..]).unwrap();
+            }
+        }
     }
 }
 
