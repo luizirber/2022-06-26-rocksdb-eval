@@ -1,10 +1,10 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use byteorder::{LittleEndian, WriteBytesExt};
-use log::info;
+use log::{debug, info, trace};
 use rkyv::{Archive, Deserialize, Serialize};
-use rocksdb::{ColumnFamilyDescriptor, Options};
+use rocksdb::{ColumnFamilyDescriptor, MergeOperands, Options};
 
 use sourmash::signature::Signature;
 use sourmash::sketch::minhash::KmerMinHash;
@@ -37,6 +37,131 @@ fn merge_colors(
 }
 */
 
+fn merge_datasets(
+    _: &[u8],
+    existing_val: Option<&[u8]>,
+    operands: &MergeOperands,
+) -> Option<Vec<u8>> {
+    debug!("triggering merge datasets");
+    let mut datasets = existing_val
+        .and_then(Datasets::from_slice)
+        .unwrap_or_default();
+
+    for op in operands {
+        let new_vals = Datasets::from_slice(op).unwrap();
+        datasets.union(new_vals);
+    }
+
+    datasets.as_bytes()
+}
+
+pub fn open_db(
+    path: &Path,
+    read_only: bool,
+    colors: bool,
+) -> (
+    Arc<DB>,
+    Option<flume::Receiver<(Option<Color>, Datasets)>>,
+    Option<flume::Sender<Color>>,
+) {
+    let mut opts = Options::default();
+    opts.set_max_open_files(1000);
+
+    // Updated defaults from
+    // https://github.com/facebook/rocksdb/wiki/Setup-Options-and-Basic-Tuning#other-general-options
+    opts.set_bytes_per_sync(1048576);
+    let mut block_opts = rocksdb::BlockBasedOptions::default();
+    block_opts.set_block_size(16 * 1024);
+    block_opts.set_cache_index_and_filter_blocks(true);
+    block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
+    block_opts.set_format_version(5);
+    opts.set_block_based_table_factory(&block_opts);
+    // End of updated defaults
+
+    if !read_only {
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+    }
+
+    let (tx_merge, rx_merge) = flume::unbounded();
+    let (tx_colors, rx_colors) = flume::unbounded();
+
+    let merge_colors = move |_: &[u8], existing_val: Option<&[u8]>, operands: &MergeOperands| {
+        trace!("triggering merge colors");
+        use byteorder::ReadBytesExt;
+
+        let current_color = if let Some(c) = existing_val {
+            Some((&c[..]).read_u64::<LittleEndian>().unwrap())
+        } else {
+            None
+        };
+
+        let mut datasets: Datasets = Default::default();
+
+        for op in operands {
+            let new_vals = Datasets::from_slice(op).unwrap();
+            datasets.union(new_vals);
+        }
+
+        trace!("sending current_color {:?}", current_color);
+        tx_merge
+            .send((current_color, datasets))
+            .expect("Error sending current_color");
+
+        trace!("receiving new color for current_color {:?}", current_color);
+        let new_color = rx_colors.recv().expect("Error receiving new color");
+        trace!("received new_color {}", new_color);
+        let mut color_bytes = vec![0u8; 8];
+        (&mut color_bytes[..])
+            .write_u64::<LittleEndian>(new_color)
+            .expect("error writing bytes");
+
+        Some(color_bytes)
+    };
+
+    let mut cfopts = Options::default();
+    cfopts.set_max_write_buffer_number(16);
+    if !read_only {
+        cfopts.set_merge_operator(
+            "datasets operator",
+            merge_colors,   // full
+            merge_datasets, // partial
+        );
+    }
+    cfopts.set_min_write_buffer_number_to_merge(10);
+
+    // Updated default from
+    // https://github.com/facebook/rocksdb/wiki/Setup-Options-and-Basic-Tuning#other-general-options
+    cfopts.set_level_compaction_dynamic_level_bytes(true);
+
+    let cf_hashes = ColumnFamilyDescriptor::new(HASHES, cfopts);
+
+    let mut cfopts = Options::default();
+    cfopts.set_max_write_buffer_number(16);
+    // Updated default
+    cfopts.set_level_compaction_dynamic_level_bytes(true);
+
+    let cf_colors = ColumnFamilyDescriptor::new(COLORS, cfopts);
+
+    let mut cfopts = Options::default();
+    cfopts.set_max_write_buffer_number(16);
+    // Updated default
+    cfopts.set_level_compaction_dynamic_level_bytes(true);
+    //cfopts.set_merge_operator_associative("colors operator", merge_colors);
+
+    let cf_sigs = ColumnFamilyDescriptor::new(SIGS, cfopts);
+
+    let cfs = vec![cf_hashes, cf_sigs, cf_colors];
+
+    let db = if read_only {
+        //TODO: error_if_log_file_exists set to false, is that an issue?
+        Arc::new(DB::open_cf_descriptors_read_only(&opts, path, cfs, false).unwrap())
+    } else {
+        Arc::new(DB::open_cf_descriptors(&opts, path, cfs).unwrap())
+    };
+    (db, Some(rx_merge), Some(tx_colors))
+}
+
 pub fn map_hashes_colors(
     db: Arc<DB>,
     dataset_id: DatasetID,
@@ -45,14 +170,14 @@ pub fn map_hashes_colors(
     template: &Sketch,
     save_paths: bool,
 ) {
-    use byteorder::ReadBytesExt;
-
     let search_sig = Signature::from_path(&filename)
         .unwrap_or_else(|_| panic!("Error processing {:?}", filename))
         .swap_remove(0);
 
     let search_mh =
         prepare_query(&search_sig, template).expect("Couldn't find a compatible MinHash");
+
+    let colors = Datasets::new(&[dataset_id]).as_bytes().unwrap();
 
     let cf_hashes = db.cf_handle(HASHES).unwrap();
 
@@ -61,26 +186,12 @@ pub fn map_hashes_colors(
     if !matched.is_empty() || size > threshold as u64 {
         // FIXME threshold is f64
         let mut hash_bytes = [0u8; 8];
-        let mut color_bytes = [0u8; 8];
         for hash in matched {
             (&mut hash_bytes[..])
                 .write_u64::<LittleEndian>(hash)
                 .expect("error writing bytes");
 
-            let current_color = if let Ok(Some(c)) = db.get_cf(&cf_hashes, &hash_bytes[..]) {
-                Some((&c[..]).read_u64::<LittleEndian>().unwrap())
-            } else {
-                None
-            };
-
-            let new_color =
-                Colors::update(db.clone(), current_color, &[dataset_id as DatasetID]).unwrap();
-
-            (&mut color_bytes[..])
-                .write_u64::<LittleEndian>(new_color)
-                .expect("error writing bytes");
-
-            db.put_cf(&cf_hashes, &hash_bytes[..], &color_bytes[..])
+            db.merge_cf(&cf_hashes, &hash_bytes[..], colors.as_slice())
                 .expect("error merging");
         }
     }
@@ -127,7 +238,7 @@ pub fn counter_for_query(db: Arc<DB>, query: &KmerMinHash) -> SigCounter {
 }
 
 use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
-type Color = u64;
+pub type Color = u64;
 
 #[derive(Default, Debug, PartialEq, Clone, Archive, Serialize, Deserialize)]
 pub struct Colors;
@@ -260,34 +371,4 @@ impl Colors {
             }
         }
     }
-}
-
-pub fn cf_descriptors() -> Vec<ColumnFamilyDescriptor> {
-    let mut cfopts = Options::default();
-    cfopts.set_max_write_buffer_number(16);
-    //cfopts.set_merge_operator_associative("datasets operator", merge_datasets);
-    cfopts.set_min_write_buffer_number_to_merge(10);
-
-    // Updated default from
-    // https://github.com/facebook/rocksdb/wiki/Setup-Options-and-Basic-Tuning#other-general-options
-    cfopts.set_level_compaction_dynamic_level_bytes(true);
-
-    let cf_hashes = ColumnFamilyDescriptor::new(HASHES, cfopts);
-
-    let mut cfopts = Options::default();
-    cfopts.set_max_write_buffer_number(16);
-    // Updated default
-    cfopts.set_level_compaction_dynamic_level_bytes(true);
-
-    let cf_colors = ColumnFamilyDescriptor::new(COLORS, cfopts);
-
-    let mut cfopts = Options::default();
-    cfopts.set_max_write_buffer_number(16);
-    // Updated default
-    cfopts.set_level_compaction_dynamic_level_bytes(true);
-    //cfopts.set_merge_operator_associative("colors operator", merge_colors);
-
-    let cf_sigs = ColumnFamilyDescriptor::new(SIGS, cfopts);
-
-    vec![cf_hashes, cf_sigs, cf_colors]
 }

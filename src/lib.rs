@@ -5,12 +5,12 @@ use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use byteorder::{LittleEndian, WriteBytesExt};
 use histogram::Histogram;
-use log::info;
+use log::{debug, error, info, trace};
 use rayon::prelude::*;
 use rkyv::{Archive, Deserialize, Serialize};
 use rocksdb::Options;
@@ -18,6 +18,8 @@ use rocksdb::Options;
 use sourmash::signature::{Signature, SigsTrait};
 use sourmash::sketch::minhash::{max_hash_for_scaled, KmerMinHash};
 use sourmash::sketch::Sketch;
+
+use crate::color_revindex::Color;
 
 //type DB = rocksdb::DBWithThreadMode<rocksdb::SingleThreaded>;
 pub type DB = rocksdb::DBWithThreadMode<rocksdb::MultiThreaded>;
@@ -29,7 +31,15 @@ pub const HASHES: &str = "hashes";
 pub const SIGS: &str = "signatures";
 pub const COLORS: &str = "colors";
 
-pub fn open_db(path: &Path, read_only: bool, colors: bool) -> Arc<DB> {
+pub fn open_db(
+    path: &Path,
+    read_only: bool,
+    colors: bool,
+) -> (
+    Arc<DB>,
+    Option<flume::Receiver<(Option<Color>, Datasets)>>,
+    Option<flume::Sender<Color>>,
+) {
     let mut opts = Options::default();
     opts.set_max_open_files(1000);
 
@@ -50,18 +60,16 @@ pub fn open_db(path: &Path, read_only: bool, colors: bool) -> Arc<DB> {
     }
 
     // prepare column family descriptors
-    let cfs = if colors {
-        color_revindex::cf_descriptors()
-    } else {
-        revindex::cf_descriptors()
-    };
+    let cfs = revindex::cf_descriptors();
 
-    if read_only {
+    let db = if read_only {
         //TODO: error_if_log_file_exists set to false, is that an issue?
         Arc::new(DB::open_cf_descriptors_read_only(&opts, path, cfs, false).unwrap())
     } else {
         Arc::new(DB::open_cf_descriptors(&opts, path, cfs).unwrap())
-    }
+    };
+
+    (db, None, None)
 }
 
 #[derive(Debug, PartialEq, Clone, Archive, Serialize, Deserialize)]
@@ -309,7 +317,11 @@ pub fn search<P: AsRef<Path>>(
 
     let threshold = threshold_bp / query.scaled() as usize;
 
-    let db = open_db(index.as_ref(), true, colors);
+    let (db, _, _) = if colors {
+        color_revindex::open_db(index.as_ref(), true, colors)
+    } else {
+        open_db(index.as_ref(), true, colors)
+    };
     info!("Loaded DB");
 
     info!("Building counter");
@@ -368,15 +380,49 @@ pub fn index<P: AsRef<Path>>(
     let index_sigs = read_paths(siglist)?;
     info!("Loaded {} sig paths in siglist", index_sigs.len());
 
-    let db = open_db(output.as_ref(), false, colors);
-
+    let (db, rx_merge, tx_colors) = if colors {
+        color_revindex::open_db(output.as_ref(), false, colors)
+    } else {
+        open_db(output.as_ref(), false, colors)
+    };
     let processed_sigs = AtomicUsize::new(0);
 
     if colors {
+        use crate::color_revindex::Colors;
+
+        let db_color = db.clone();
+        let (rx_merge, tx_colors) = (rx_merge.unwrap(), tx_colors.unwrap());
+        let finished = Arc::new(AtomicBool::new(false));
+
+        let finished_color = finished.clone();
+        let color_writer = std::thread::spawn(move || {
+            debug!("color thread spawned");
+            let mut color_bytes = [0u8; 8];
+
+            debug!("waiting for colors");
+            while !finished_color.load(Ordering::Relaxed) {
+                for (current_color, new_idx) in rx_merge.try_iter() {
+                    trace!("received color {:?}", current_color);
+                    let new_idx: Vec<_> = new_idx.into_iter().collect();
+                    let new_color =
+                        Colors::update(db_color.clone(), current_color, new_idx.as_slice())
+                            .unwrap();
+
+                    (&mut color_bytes[..])
+                        .write_u64::<LittleEndian>(new_color)
+                        .expect("error writing bytes");
+
+                    tx_colors.send(new_color).expect("error sending color");
+                    trace!("sent color {}", new_color);
+                }
+            }
+            debug!("Finishing colors thread");
+        });
+
         index_sigs
             .iter()
             .enumerate()
-            .filter_map(|(dataset_id, filename)| {
+            .for_each(|(dataset_id, filename)| {
                 let i = processed_sigs.fetch_add(1, Ordering::SeqCst);
                 if i % 1000 == 0 {
                     info!("Processed {} reference sigs", i);
@@ -390,9 +436,16 @@ pub fn index<P: AsRef<Path>>(
                     &template,
                     save_paths,
                 );
-                Some(true)
-            })
-            .count();
+            });
+
+        info!("Compressing colors");
+        Colors::compress(db.clone());
+        info!("Finished compressing colors");
+        finished.store(true, Ordering::Relaxed);
+
+        if let Err(e) = color_writer.join() {
+            error!("Unable to join internal thread: {:?}", e);
+        };
     } else {
         index_sigs
             .par_iter()
@@ -418,14 +471,20 @@ pub fn index<P: AsRef<Path>>(
 
     info!("Processed {} reference sigs", processed_sigs.into_inner());
 
-    if colors {
-        use crate::color_revindex::Colors;
-
-        info!("Compressing colors");
-        Colors::compress(db.clone());
-        info!("Finished compressing colors");
-    }
     db.compact_range(None::<&[u8]>, None::<&[u8]>);
+
+    db.flush_wal(true)?;
+
+    let cf = db.cf_handle(HASHES).unwrap();
+    db.flush_cf(&cf)?;
+
+    let cf = db.cf_handle(SIGS).unwrap();
+    db.flush_cf(&cf)?;
+
+    if colors {
+        let cf = db.cf_handle(COLORS).unwrap();
+        db.flush_cf(&cf)?;
+    }
 
     Ok(())
 }
@@ -438,7 +497,11 @@ pub fn check<P: AsRef<Path>>(
     use byteorder::ReadBytesExt;
     use numsep::{separate, Locale};
 
-    let db = open_db(output.as_ref(), true, colors);
+    let (db, _, _) = if colors {
+        color_revindex::open_db(output.as_ref(), true, colors)
+    } else {
+        open_db(output.as_ref(), true, colors)
+    };
 
     let deep_check = if colors { COLORS } else { HASHES };
 

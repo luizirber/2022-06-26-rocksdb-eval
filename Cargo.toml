@@ -10,6 +10,7 @@ byteorder = "1.4.3"
 clap = { version = "3.2.8", features = [ "derive" ] }
 counter = "0.5.5"
 env_logger = "0.9.0"
+flume = "0.10.13"
 histogram = "0.6.9"
 log = "0.4.17"
 numsep = "0.1.12"
