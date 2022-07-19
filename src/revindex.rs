@@ -1,8 +1,10 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use byteorder::{LittleEndian, WriteBytesExt};
 use log::info;
+use rayon::prelude::*;
 use rocksdb::{ColumnFamilyDescriptor, MergeOperands, Options};
 
 use sourmash::signature::Signature;
@@ -10,7 +12,9 @@ use sourmash::sketch::minhash::KmerMinHash;
 use sourmash::sketch::Sketch;
 
 use crate::prepare_query;
-use crate::{sig_save_to_db, DatasetID, Datasets, SigCounter, DB, HASHES, SIGS};
+use crate::{
+    sig_save_to_db, stats_for_cf, DatasetID, Datasets, SigCounter, SignatureData, DB, HASHES, SIGS,
+};
 
 fn merge_datasets(
     _: &[u8],
@@ -94,6 +98,74 @@ pub fn counter_for_query(db: Arc<DB>, query: &KmerMinHash) -> SigCounter {
             new_vals.into_iter()
         })
         .collect()
+}
+
+pub fn matches_from_counter(db: Arc<DB>, counter: SigCounter, threshold: usize) -> Vec<String> {
+    let cf_sigs = db.cf_handle(SIGS).unwrap();
+
+    let matches_iter = counter
+        .most_common()
+        .into_iter()
+        .filter_map(|(dataset_id, size)| {
+            if size >= threshold {
+                let mut v = vec![0_u8; 8];
+                (&mut v[..])
+                    .write_u64::<LittleEndian>(dataset_id)
+                    .expect("error writing bytes");
+                Some((&cf_sigs, v))
+            } else {
+                None
+            }
+        });
+
+    info!("Multi get matches");
+    db.multi_get_cf(matches_iter)
+        .into_iter()
+        .filter_map(|r| r.ok().unwrap_or(None))
+        .filter_map(
+            |sigdata| match SignatureData::from_slice(&sigdata).unwrap() {
+                SignatureData::Empty => None,
+                SignatureData::External(p) => Some(p),
+                SignatureData::Internal(sig) => Some(sig.name()),
+            },
+        )
+        .collect()
+}
+
+pub fn index(
+    db: Arc<DB>,
+    index_sigs: Vec<PathBuf>,
+    template: &Sketch,
+    threshold: f64,
+    save_paths: bool,
+) {
+    let processed_sigs = AtomicUsize::new(0);
+
+    index_sigs
+        .par_iter()
+        .enumerate()
+        .for_each(|(dataset_id, filename)| {
+            let i = processed_sigs.fetch_add(1, Ordering::SeqCst);
+            if i % 1000 == 0 {
+                info!("Processed {} reference sigs", i);
+            }
+
+            map_hashes_colors(
+                db.clone(),
+                dataset_id as DatasetID,
+                filename,
+                threshold,
+                &template,
+                save_paths,
+            );
+        });
+    info!("Processed {} reference sigs", processed_sigs.into_inner());
+}
+
+pub fn check(db: Arc<DB>, quick: bool) {
+    stats_for_cf(db.clone(), HASHES, true, quick);
+    info!("");
+    stats_for_cf(db.clone(), SIGS, false, quick);
 }
 
 pub fn cf_descriptors() -> Vec<ColumnFamilyDescriptor> {

@@ -1,8 +1,9 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use byteorder::{LittleEndian, WriteBytesExt};
-use log::{debug, info, trace};
+use log::{debug, error, info, trace};
 use rkyv::{Archive, Deserialize, Serialize};
 use rocksdb::{ColumnFamilyDescriptor, MergeOperands, Options};
 
@@ -11,7 +12,10 @@ use sourmash::sketch::minhash::KmerMinHash;
 use sourmash::sketch::Sketch;
 
 use crate::prepare_query;
-use crate::{sig_save_to_db, DatasetID, Datasets, SigCounter, COLORS, DB, HASHES, SIGS};
+use crate::{
+    sig_save_to_db, stats_for_cf, DatasetID, Datasets, RevIndex, SigCounter, SignatureData, COLORS,
+    DB, HASHES, SIGS,
+};
 
 /*
 enum ColorCollision {
@@ -37,217 +41,383 @@ fn merge_colors(
 }
 */
 
-fn merge_datasets(
-    _: &[u8],
-    existing_val: Option<&[u8]>,
-    operands: &MergeOperands,
-) -> Option<Vec<u8>> {
-    debug!("triggering merge datasets");
-    let mut datasets = existing_val
-        .and_then(Datasets::from_slice)
-        .unwrap_or_default();
-
-    for op in operands {
-        let new_vals = Datasets::from_slice(op).unwrap();
-        datasets.union(new_vals);
-    }
-
-    datasets.as_bytes()
+#[derive(Debug, Clone)]
+pub struct ColorRevIndex {
+    db: Arc<DB>,
+    rx_merge: flume::Receiver<(Option<Color>, Datasets)>,
+    tx_colors: flume::Sender<Color>,
 }
 
-pub fn open_db(
-    path: &Path,
-    read_only: bool,
-    colors: bool,
-) -> (
-    Arc<DB>,
-    Option<flume::Receiver<(Option<Color>, Datasets)>>,
-    Option<flume::Sender<Color>>,
-) {
-    let mut opts = Options::default();
-    opts.set_max_open_files(1000);
-
-    // Updated defaults from
-    // https://github.com/facebook/rocksdb/wiki/Setup-Options-and-Basic-Tuning#other-general-options
-    opts.set_bytes_per_sync(1048576);
-    let mut block_opts = rocksdb::BlockBasedOptions::default();
-    block_opts.set_block_size(16 * 1024);
-    block_opts.set_cache_index_and_filter_blocks(true);
-    block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
-    block_opts.set_format_version(5);
-    opts.set_block_based_table_factory(&block_opts);
-    // End of updated defaults
-
-    if !read_only {
-        opts.create_if_missing(true);
-        opts.create_missing_column_families(true);
-    }
-
-    let (tx_merge, rx_merge) = flume::unbounded();
-    let (tx_colors, rx_colors) = flume::unbounded();
-
-    let merge_colors = move |_: &[u8], existing_val: Option<&[u8]>, operands: &MergeOperands| {
-        trace!("triggering merge colors");
-        use byteorder::ReadBytesExt;
-
-        let current_color = if let Some(c) = existing_val {
-            Some((&c[..]).read_u64::<LittleEndian>().unwrap())
-        } else {
-            None
-        };
-
-        let mut datasets: Datasets = Default::default();
+impl ColorRevIndex {
+    fn merge_datasets(
+        _: &[u8],
+        existing_val: Option<&[u8]>,
+        operands: &MergeOperands,
+    ) -> Option<Vec<u8>> {
+        trace!("triggering merge datasets");
+        let mut datasets = existing_val
+            .and_then(Datasets::from_slice)
+            .unwrap_or_default();
 
         for op in operands {
             let new_vals = Datasets::from_slice(op).unwrap();
             datasets.union(new_vals);
         }
 
-        trace!("sending current_color {:?}", current_color);
-        tx_merge
-            .send((current_color, datasets))
-            .expect("Error sending current_color");
+        datasets.as_bytes()
+    }
 
-        trace!("receiving new color for current_color {:?}", current_color);
-        let new_color = rx_colors.recv().expect("Error receiving new color");
-        trace!("received new_color {}", new_color);
-        let mut color_bytes = vec![0u8; 8];
-        (&mut color_bytes[..])
-            .write_u64::<LittleEndian>(new_color)
-            .expect("error writing bytes");
+    pub fn open(path: &Path, read_only: bool) -> RevIndex {
+        let mut opts = Options::default();
+        opts.set_max_open_files(1000);
 
-        Some(color_bytes)
-    };
+        // Updated defaults from
+        // https://github.com/facebook/rocksdb/wiki/Setup-Options-and-Basic-Tuning#other-general-options
+        opts.set_bytes_per_sync(1048576);
+        let mut block_opts = rocksdb::BlockBasedOptions::default();
+        block_opts.set_block_size(16 * 1024);
+        block_opts.set_cache_index_and_filter_blocks(true);
+        block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
+        block_opts.set_format_version(5);
+        opts.set_block_based_table_factory(&block_opts);
+        // End of updated defaults
 
-    let mut cfopts = Options::default();
-    cfopts.set_max_write_buffer_number(16);
-    if !read_only {
+        if !read_only {
+            opts.create_if_missing(true);
+            opts.create_missing_column_families(true);
+        }
+
+        let (tx_merge, rx_merge) = flume::unbounded();
+        let (tx_colors, rx_colors) = flume::unbounded();
+
+        let merge_colors =
+            move |_: &[u8], existing_val: Option<&[u8]>, operands: &MergeOperands| {
+                trace!("triggering merge colors");
+                use byteorder::ReadBytesExt;
+
+                let current_color = if let Some(c) = existing_val {
+                    Some((&c[..]).read_u64::<LittleEndian>().unwrap())
+                } else {
+                    None
+                };
+
+                let mut datasets: Datasets = Default::default();
+
+                for op in operands {
+                    let new_vals = Datasets::from_slice(op).unwrap();
+                    datasets.union(new_vals);
+                }
+
+                trace!("sending current_color {:?}", current_color);
+                tx_merge
+                    .send((current_color, datasets))
+                    .expect("Error sending current_color");
+
+                trace!("receiving new color for current_color {:?}", current_color);
+                let new_color = rx_colors.recv().expect("Error receiving new color");
+                trace!("received new_color {}", new_color);
+                let mut color_bytes = vec![0u8; 8];
+                (&mut color_bytes[..])
+                    .write_u64::<LittleEndian>(new_color)
+                    .expect("error writing bytes");
+
+                Some(color_bytes)
+            };
+
+        let mut cfopts = Options::default();
+        cfopts.set_max_write_buffer_number(16);
         cfopts.set_merge_operator(
             "datasets operator",
-            merge_colors,   // full
-            merge_datasets, // partial
+            merge_colors,         // full
+            Self::merge_datasets, // partial
+        );
+        cfopts.set_min_write_buffer_number_to_merge(10);
+
+        // Updated default from
+        // https://github.com/facebook/rocksdb/wiki/Setup-Options-and-Basic-Tuning#other-general-options
+        cfopts.set_level_compaction_dynamic_level_bytes(true);
+
+        let cf_hashes = ColumnFamilyDescriptor::new(HASHES, cfopts);
+
+        let mut cfopts = Options::default();
+        cfopts.set_max_write_buffer_number(16);
+        // Updated default
+        cfopts.set_level_compaction_dynamic_level_bytes(true);
+
+        let cf_colors = ColumnFamilyDescriptor::new(COLORS, cfopts);
+
+        let mut cfopts = Options::default();
+        cfopts.set_max_write_buffer_number(16);
+        // Updated default
+        cfopts.set_level_compaction_dynamic_level_bytes(true);
+        //cfopts.set_merge_operator_associative("colors operator", merge_colors);
+
+        let cf_sigs = ColumnFamilyDescriptor::new(SIGS, cfopts);
+
+        let cfs = vec![cf_hashes, cf_sigs, cf_colors];
+
+        let db = if read_only {
+            //TODO: error_if_log_file_exists set to false, is that an issue?
+            Arc::new(DB::open_cf_descriptors_read_only(&opts, path, cfs, false).unwrap())
+        } else {
+            Arc::new(DB::open_cf_descriptors(&opts, path, cfs).unwrap())
+        };
+
+        RevIndex::Color(Self {
+            db,
+            rx_merge,
+            tx_colors,
+        })
+    }
+
+    pub fn map_hashes_colors(
+        &self,
+        dataset_id: DatasetID,
+        filename: &PathBuf,
+        threshold: f64,
+        template: &Sketch,
+        save_paths: bool,
+    ) {
+        let search_sig = Signature::from_path(&filename)
+            .unwrap_or_else(|_| panic!("Error processing {:?}", filename))
+            .swap_remove(0);
+
+        let search_mh =
+            prepare_query(&search_sig, template).expect("Couldn't find a compatible MinHash");
+
+        let colors = Datasets::new(&[dataset_id]).as_bytes().unwrap();
+
+        let cf_hashes = self.db.cf_handle(HASHES).unwrap();
+
+        let matched = search_mh.mins();
+        let size = matched.len() as u64;
+        if !matched.is_empty() || size > threshold as u64 {
+            // FIXME threshold is f64
+            let mut hash_bytes = [0u8; 8];
+            for hash in matched {
+                (&mut hash_bytes[..])
+                    .write_u64::<LittleEndian>(hash)
+                    .expect("error writing bytes");
+
+                self.db
+                    .merge_cf(&cf_hashes, &hash_bytes[..], colors.as_slice())
+                    .expect("error merging");
+            }
+        }
+
+        sig_save_to_db(
+            self.db.clone(),
+            search_sig,
+            search_mh,
+            size,
+            threshold,
+            save_paths,
+            filename,
+            dataset_id,
         );
     }
-    cfopts.set_min_write_buffer_number_to_merge(10);
 
-    // Updated default from
-    // https://github.com/facebook/rocksdb/wiki/Setup-Options-and-Basic-Tuning#other-general-options
-    cfopts.set_level_compaction_dynamic_level_bytes(true);
+    pub fn counter_for_query(&self, query: &KmerMinHash) -> SigCounter {
+        let finished = Arc::new(AtomicBool::new(false));
+        let color_writer = self.set_up_color_writer(finished.clone());
 
-    let cf_hashes = ColumnFamilyDescriptor::new(HASHES, cfopts);
-
-    let mut cfopts = Options::default();
-    cfopts.set_max_write_buffer_number(16);
-    // Updated default
-    cfopts.set_level_compaction_dynamic_level_bytes(true);
-
-    let cf_colors = ColumnFamilyDescriptor::new(COLORS, cfopts);
-
-    let mut cfopts = Options::default();
-    cfopts.set_max_write_buffer_number(16);
-    // Updated default
-    cfopts.set_level_compaction_dynamic_level_bytes(true);
-    //cfopts.set_merge_operator_associative("colors operator", merge_colors);
-
-    let cf_sigs = ColumnFamilyDescriptor::new(SIGS, cfopts);
-
-    let cfs = vec![cf_hashes, cf_sigs, cf_colors];
-
-    let db = if read_only {
-        //TODO: error_if_log_file_exists set to false, is that an issue?
-        Arc::new(DB::open_cf_descriptors_read_only(&opts, path, cfs, false).unwrap())
-    } else {
-        Arc::new(DB::open_cf_descriptors(&opts, path, cfs).unwrap())
-    };
-    (db, Some(rx_merge), Some(tx_colors))
-}
-
-pub fn map_hashes_colors(
-    db: Arc<DB>,
-    dataset_id: DatasetID,
-    filename: &PathBuf,
-    threshold: f64,
-    template: &Sketch,
-    save_paths: bool,
-) {
-    let search_sig = Signature::from_path(&filename)
-        .unwrap_or_else(|_| panic!("Error processing {:?}", filename))
-        .swap_remove(0);
-
-    let search_mh =
-        prepare_query(&search_sig, template).expect("Couldn't find a compatible MinHash");
-
-    let colors = Datasets::new(&[dataset_id]).as_bytes().unwrap();
-
-    let cf_hashes = db.cf_handle(HASHES).unwrap();
-
-    let matched = search_mh.mins();
-    let size = matched.len() as u64;
-    if !matched.is_empty() || size > threshold as u64 {
-        // FIXME threshold is f64
-        let mut hash_bytes = [0u8; 8];
-        for hash in matched {
-            (&mut hash_bytes[..])
-                .write_u64::<LittleEndian>(hash)
+        info!("Collecting hashes");
+        let cf_hashes = self.db.cf_handle(HASHES).unwrap();
+        let hashes_iter = query.iter_mins().map(|hash| {
+            let mut v = vec![0_u8; 8];
+            (&mut v[..])
+                .write_u64::<LittleEndian>(*hash)
                 .expect("error writing bytes");
+            (&cf_hashes, v)
+        });
 
-            db.merge_cf(&cf_hashes, &hash_bytes[..], colors.as_slice())
-                .expect("error merging");
+        info!("Multi get hashes");
+        let cf_colors = self.db.cf_handle(COLORS).unwrap();
+        let colors_iter = self
+            .db
+            .multi_get_cf(hashes_iter)
+            .into_iter()
+            .filter_map(|r| r.ok().unwrap_or(None).map(|color| (&cf_colors, color)));
+
+        info!("Multi get colors");
+        let counter = self
+            .db
+            .multi_get_cf(colors_iter)
+            .into_iter()
+            .filter_map(|r| r.ok().unwrap_or(None))
+            .flat_map(|datasets| {
+                let new_vals = Datasets::from_slice(&datasets).unwrap();
+                new_vals.into_iter()
+            })
+            .collect();
+        finished.store(true, Ordering::Relaxed);
+
+        if let Err(e) = color_writer.join() {
+            error!("Unable to join internal thread: {:?}", e);
+        };
+
+        counter
+    }
+
+    pub fn matches_from_counter(self, counter: SigCounter, threshold: usize) -> Vec<String> {
+        let finished = Arc::new(AtomicBool::new(false));
+        let color_writer = self.set_up_color_writer(finished.clone());
+
+        let cf_sigs = self.db.cf_handle(SIGS).unwrap();
+
+        let matches_iter = counter
+            .most_common()
+            .into_iter()
+            .filter_map(|(dataset_id, size)| {
+                if size >= threshold {
+                    let mut v = vec![0_u8; 8];
+                    (&mut v[..])
+                        .write_u64::<LittleEndian>(dataset_id)
+                        .expect("error writing bytes");
+                    Some((&cf_sigs, v))
+                } else {
+                    None
+                }
+            });
+
+        info!("Multi get matches");
+        let matches = self
+            .db
+            .multi_get_cf(matches_iter)
+            .into_iter()
+            .filter_map(|r| r.ok().unwrap_or(None))
+            .filter_map(
+                |sigdata| match SignatureData::from_slice(&sigdata).unwrap() {
+                    SignatureData::Empty => None,
+                    SignatureData::External(p) => Some(p),
+                    SignatureData::Internal(sig) => Some(sig.name()),
+                },
+            )
+            .collect();
+        finished.store(true, Ordering::Relaxed);
+
+        if let Err(e) = color_writer.join() {
+            error!("Unable to join internal thread: {:?}", e);
+        };
+
+        matches
+    }
+
+    fn set_up_color_writer(&self, finished_color: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
+        let color_db = self.db.clone();
+        let tx_colors = self.tx_colors.clone();
+        let rx_merge = self.rx_merge.clone();
+
+        std::thread::spawn(move || {
+            debug!("color thread spawned");
+            let mut color_bytes = [0u8; 8];
+
+            debug!("waiting for colors");
+            while !finished_color.load(Ordering::Relaxed) {
+                for (current_color, new_idx) in rx_merge.try_iter() {
+                    trace!("received color {:?}", current_color);
+                    let new_idx: Vec<_> = new_idx.into_iter().collect();
+                    let new_color =
+                        Colors::update(color_db.clone(), current_color, new_idx.as_slice())
+                            .unwrap();
+
+                    (&mut color_bytes[..])
+                        .write_u64::<LittleEndian>(new_color)
+                        .expect("error writing bytes");
+
+                    tx_colors.send(new_color).expect("error sending color");
+                    trace!("sent color {}", new_color);
+                }
+            }
+            debug!("Finishing colors thread");
+        })
+    }
+
+    pub fn index(
+        &self,
+        index_sigs: Vec<PathBuf>,
+        template: &Sketch,
+        threshold: f64,
+        save_paths: bool,
+    ) {
+        let finished = Arc::new(AtomicBool::new(false));
+        let color_writer = self.set_up_color_writer(finished.clone());
+
+        let processed_sigs = AtomicUsize::new(0);
+        index_sigs
+            .iter()
+            .enumerate()
+            .for_each(|(dataset_id, filename)| {
+                let i = processed_sigs.fetch_add(1, Ordering::SeqCst);
+                if i % 1000 == 0 {
+                    info!("Processed {} reference sigs", i);
+                }
+
+                self.map_hashes_colors(
+                    dataset_id as DatasetID,
+                    filename,
+                    threshold,
+                    &template,
+                    save_paths,
+                );
+            });
+        info!("Processed {} reference sigs", processed_sigs.into_inner());
+
+        info!("Compressing colors");
+        Colors::compress(self.db.clone());
+        info!("Finished compressing colors");
+
+        self.compact();
+        self.flush().unwrap();
+        finished.store(true, Ordering::Relaxed);
+
+        if let Err(e) = color_writer.join() {
+            error!("Unable to join internal thread: {:?}", e);
+        };
+    }
+
+    pub fn compact(&self) {
+        for cf_name in [HASHES, SIGS, COLORS] {
+            let cf = self.db.cf_handle(cf_name).unwrap();
+            self.db.compact_range_cf(&cf, None::<&[u8]>, None::<&[u8]>)
         }
     }
 
-    sig_save_to_db(
-        db.clone(),
-        search_sig,
-        search_mh,
-        size,
-        threshold,
-        save_paths,
-        filename,
-        dataset_id,
-    );
-}
+    pub fn flush(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.db.flush_wal(true)?;
 
-pub fn counter_for_query(db: Arc<DB>, query: &KmerMinHash) -> SigCounter {
-    info!("Collecting hashes");
-    let cf_hashes = db.cf_handle(HASHES).unwrap();
-    let hashes_iter = query.iter_mins().map(|hash| {
-        let mut v = vec![0_u8; 8];
-        (&mut v[..])
-            .write_u64::<LittleEndian>(*hash)
-            .expect("error writing bytes");
-        (&cf_hashes, v)
-    });
+        for cf_name in [HASHES, SIGS, COLORS] {
+            let cf = self.db.cf_handle(cf_name).unwrap();
+            self.db.flush_cf(&cf)?;
+        }
 
-    info!("Multi get hashes");
-    let cf_colors = db.cf_handle(COLORS).unwrap();
-    let colors_iter = db
-        .multi_get_cf(hashes_iter)
-        .into_iter()
-        .filter_map(|r| r.ok().unwrap_or(None).map(|color| (&cf_colors, color)));
+        Ok(())
+    }
 
-    info!("Multi get colors");
-    db.multi_get_cf(colors_iter)
-        .into_iter()
-        .filter_map(|r| r.ok().unwrap_or(None))
-        .flat_map(|datasets| {
-            let new_vals = Datasets::from_slice(&datasets).unwrap();
-            new_vals.into_iter()
-        })
-        .collect()
+    pub fn check(&self, quick: bool) {
+        let finished = Arc::new(AtomicBool::new(false));
+        let color_writer = self.set_up_color_writer(finished.clone());
+
+        stats_for_cf(self.db.clone(), HASHES, false, quick);
+        info!("");
+        stats_for_cf(self.db.clone(), COLORS, true, quick);
+        info!("");
+        stats_for_cf(self.db.clone(), SIGS, false, quick);
+        finished.store(true, Ordering::Relaxed);
+
+        if let Err(e) = color_writer.join() {
+            error!("Unable to join internal thread: {:?}", e);
+        };
+    }
 }
 
 use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
-pub type Color = u64;
+type Color = u64;
 
 #[derive(Default, Debug, PartialEq, Clone, Archive, Serialize, Deserialize)]
-pub struct Colors;
+struct Colors;
 
 impl Colors {
-    pub fn new() -> Colors {
-        Default::default()
-    }
-
     /// Given a color and a new idx, return an updated color
     ///
     /// This might create a new one, or find an already existing color

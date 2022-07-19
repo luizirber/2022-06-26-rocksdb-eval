@@ -1,11 +1,13 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
+use log::info;
 
+use sourmash::signature::Signature;
 use sourmash::sketch::minhash::{max_hash_for_scaled, KmerMinHash};
 use sourmash::sketch::Sketch;
 
-use rocks_eval::{check, index, search};
+use rocks_eval::{prepare_query, read_paths, RevIndex};
 
 fn build_template(ksize: u8, scaled: usize) -> Sketch {
     let max_hash = max_hash_for_scaled(scaled as u64);
@@ -97,6 +99,73 @@ enum Commands {
         #[clap(long = "colors")]
         colors: bool,
     },
+}
+
+pub fn search<P: AsRef<Path>>(
+    queries_file: P,
+    index: P,
+    template: Sketch,
+    threshold_bp: usize,
+    _output: Option<P>,
+    colors: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let query_sig = Signature::from_path(queries_file)?;
+
+    let mut query = None;
+    for sig in &query_sig {
+        if let Some(q) = prepare_query(sig, &template) {
+            query = Some(q);
+        }
+    }
+    let query = query.expect("Couldn't find a compatible MinHash");
+
+    let threshold = threshold_bp / query.scaled() as usize;
+
+    let db = RevIndex::open(index.as_ref(), false, colors);
+    info!("Loaded DB");
+
+    info!("Building counter");
+    let counter = db.counter_for_query(&query);
+    info!("Counter built");
+
+    let matches = db.matches_from_counter(counter, threshold);
+
+    info!("matches: {}", matches.len());
+    //info!("matches: {:?}", matches);
+
+    Ok(())
+}
+pub fn index<P: AsRef<Path>>(
+    siglist: P,
+    template: Sketch,
+    threshold: f64,
+    output: P,
+    save_paths: bool,
+    colors: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    info!("Loading siglist");
+    let index_sigs = read_paths(siglist)?;
+    info!("Loaded {} sig paths in siglist", index_sigs.len());
+
+    let db = RevIndex::open(output.as_ref(), false, colors);
+    db.index(index_sigs, &template, threshold, save_paths);
+
+    Ok(())
+}
+
+pub fn check<P: AsRef<Path>>(
+    output: P,
+    quick: bool,
+    colors: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    info!("Opening DB");
+    let db = RevIndex::open(output.as_ref(), false, colors);
+
+    info!("Starting check");
+    db.check(quick);
+
+    info!("Finished check");
+    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

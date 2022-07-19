@@ -5,21 +5,17 @@ use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use byteorder::{LittleEndian, WriteBytesExt};
 use histogram::Histogram;
-use log::{debug, error, info, trace};
-use rayon::prelude::*;
+use log::info;
 use rkyv::{Archive, Deserialize, Serialize};
 use rocksdb::Options;
 
 use sourmash::signature::{Signature, SigsTrait};
 use sourmash::sketch::minhash::{max_hash_for_scaled, KmerMinHash};
 use sourmash::sketch::Sketch;
-
-use crate::color_revindex::Color;
 
 //type DB = rocksdb::DBWithThreadMode<rocksdb::SingleThreaded>;
 pub type DB = rocksdb::DBWithThreadMode<rocksdb::MultiThreaded>;
@@ -31,15 +27,80 @@ pub const HASHES: &str = "hashes";
 pub const SIGS: &str = "signatures";
 pub const COLORS: &str = "colors";
 
-pub fn open_db(
-    path: &Path,
-    read_only: bool,
-    colors: bool,
-) -> (
-    Arc<DB>,
-    Option<flume::Receiver<(Option<Color>, Datasets)>>,
-    Option<flume::Sender<Color>>,
-) {
+pub enum RevIndex {
+    Color(color_revindex::ColorRevIndex),
+    Plain(Arc<DB>),
+}
+
+impl RevIndex {
+    pub fn counter_for_query(&self, query: &KmerMinHash) -> SigCounter {
+        match self {
+            Self::Color(db) => db.counter_for_query(query),
+            Self::Plain(db) => revindex::counter_for_query(db.clone(), query),
+        }
+    }
+    pub fn matches_from_counter(self, counter: SigCounter, threshold: usize) -> Vec<String> {
+        match self {
+            Self::Color(db) => db.matches_from_counter(counter, threshold),
+            Self::Plain(db) => revindex::matches_from_counter(db.clone(), counter, threshold),
+        }
+    }
+
+    pub fn index(
+        &self,
+        index_sigs: Vec<PathBuf>,
+        template: &Sketch,
+        threshold: f64,
+        save_paths: bool,
+    ) {
+        match self {
+            Self::Color(db) => db.index(index_sigs, template, threshold, save_paths),
+            Self::Plain(db) => {
+                revindex::index(db.clone(), index_sigs, template, threshold, save_paths)
+            }
+        }
+    }
+
+    pub fn compact(&self) {
+        match self {
+            Self::Color(db) => db.compact(),
+            Self::Plain(db) => db.compact_range(None::<&[u8]>, None::<&[u8]>),
+        };
+    }
+
+    pub fn flush(&self) -> Result<(), Box<dyn std::error::Error>> {
+        match self {
+            Self::Color(db) => db.flush(),
+            Self::Plain(db) => {
+                db.flush_wal(true)?;
+
+                let cf = db.cf_handle(HASHES).unwrap();
+                db.flush_cf(&cf)?;
+
+                let cf = db.cf_handle(SIGS).unwrap();
+                db.flush_cf(&cf)?;
+
+                Ok(())
+            }
+        }
+    }
+    pub fn check(&self, quick: bool) {
+        match self {
+            Self::Color(db) => db.check(quick),
+            Self::Plain(db) => revindex::check(db.clone(), quick),
+        }
+    }
+
+    pub fn open(index: &Path, read_only: bool, colors: bool) -> Self {
+        if colors {
+            color_revindex::ColorRevIndex::open(index.as_ref(), read_only)
+        } else {
+            open_db(index.as_ref(), read_only)
+        }
+    }
+}
+
+pub fn open_db(path: &Path, read_only: bool) -> RevIndex {
     let mut opts = Options::default();
     opts.set_max_open_files(1000);
 
@@ -63,13 +124,12 @@ pub fn open_db(
     let cfs = revindex::cf_descriptors();
 
     let db = if read_only {
-        //TODO: error_if_log_file_exists set to false, is that an issue?
         Arc::new(DB::open_cf_descriptors_read_only(&opts, path, cfs, false).unwrap())
     } else {
         Arc::new(DB::open_cf_descriptors(&opts, path, cfs).unwrap())
     };
 
-    (db, None, None)
+    RevIndex::Plain(db)
 }
 
 #[derive(Debug, PartialEq, Clone, Archive, Serialize, Deserialize)]
@@ -297,274 +357,6 @@ impl Datasets {
     }
 }
 
-pub fn search<P: AsRef<Path>>(
-    queries_file: P,
-    index: P,
-    template: Sketch,
-    threshold_bp: usize,
-    _output: Option<P>,
-    colors: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let query_sig = Signature::from_path(queries_file)?;
-
-    let mut query = None;
-    for sig in &query_sig {
-        if let Some(q) = prepare_query(sig, &template) {
-            query = Some(q);
-        }
-    }
-    let query = query.expect("Couldn't find a compatible MinHash");
-
-    let threshold = threshold_bp / query.scaled() as usize;
-
-    let (db, _, _) = if colors {
-        color_revindex::open_db(index.as_ref(), true, colors)
-    } else {
-        open_db(index.as_ref(), true, colors)
-    };
-    info!("Loaded DB");
-
-    info!("Building counter");
-    let counter = if colors {
-        color_revindex::counter_for_query(db.clone(), &query)
-    } else {
-        revindex::counter_for_query(db.clone(), &query)
-    };
-    info!("Counter built");
-
-    let cf_sigs = db.cf_handle(SIGS).unwrap();
-
-    let matches_iter = counter
-        .most_common()
-        .into_iter()
-        .filter_map(|(dataset_id, size)| {
-            if size >= threshold {
-                let mut v = vec![0_u8; 8];
-                (&mut v[..])
-                    .write_u64::<LittleEndian>(dataset_id)
-                    .expect("error writing bytes");
-                Some((&cf_sigs, v))
-            } else {
-                None
-            }
-        });
-
-    info!("Multi get matches");
-    let matches: Vec<String> = db
-        .multi_get_cf(matches_iter)
-        .into_iter()
-        .filter_map(|r| r.ok().unwrap_or(None))
-        .filter_map(
-            |sigdata| match SignatureData::from_slice(&sigdata).unwrap() {
-                SignatureData::Empty => None,
-                SignatureData::External(p) => Some(p),
-                SignatureData::Internal(sig) => Some(sig.name()),
-            },
-        )
-        .collect();
-
-    info!("matches: {}", matches.len());
-    //info!("matches: {:?}", matches);
-
-    Ok(())
-}
-pub fn index<P: AsRef<Path>>(
-    siglist: P,
-    template: Sketch,
-    threshold: f64,
-    output: P,
-    save_paths: bool,
-    colors: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    info!("Loading siglist");
-    let index_sigs = read_paths(siglist)?;
-    info!("Loaded {} sig paths in siglist", index_sigs.len());
-
-    let (db, rx_merge, tx_colors) = if colors {
-        color_revindex::open_db(output.as_ref(), false, colors)
-    } else {
-        open_db(output.as_ref(), false, colors)
-    };
-    let processed_sigs = AtomicUsize::new(0);
-
-    if colors {
-        use crate::color_revindex::Colors;
-
-        let db_color = db.clone();
-        let (rx_merge, tx_colors) = (rx_merge.unwrap(), tx_colors.unwrap());
-        let finished = Arc::new(AtomicBool::new(false));
-
-        let finished_color = finished.clone();
-        let color_writer = std::thread::spawn(move || {
-            debug!("color thread spawned");
-            let mut color_bytes = [0u8; 8];
-
-            debug!("waiting for colors");
-            while !finished_color.load(Ordering::Relaxed) {
-                for (current_color, new_idx) in rx_merge.try_iter() {
-                    trace!("received color {:?}", current_color);
-                    let new_idx: Vec<_> = new_idx.into_iter().collect();
-                    let new_color =
-                        Colors::update(db_color.clone(), current_color, new_idx.as_slice())
-                            .unwrap();
-
-                    (&mut color_bytes[..])
-                        .write_u64::<LittleEndian>(new_color)
-                        .expect("error writing bytes");
-
-                    tx_colors.send(new_color).expect("error sending color");
-                    trace!("sent color {}", new_color);
-                }
-            }
-            debug!("Finishing colors thread");
-        });
-
-        index_sigs
-            .iter()
-            .enumerate()
-            .for_each(|(dataset_id, filename)| {
-                let i = processed_sigs.fetch_add(1, Ordering::SeqCst);
-                if i % 1000 == 0 {
-                    info!("Processed {} reference sigs", i);
-                }
-
-                color_revindex::map_hashes_colors(
-                    db.clone(),
-                    dataset_id as DatasetID,
-                    filename,
-                    threshold,
-                    &template,
-                    save_paths,
-                );
-            });
-
-        info!("Compressing colors");
-        Colors::compress(db.clone());
-        info!("Finished compressing colors");
-        finished.store(true, Ordering::Relaxed);
-
-        if let Err(e) = color_writer.join() {
-            error!("Unable to join internal thread: {:?}", e);
-        };
-    } else {
-        index_sigs
-            .par_iter()
-            .enumerate()
-            .filter_map(|(dataset_id, filename)| {
-                let i = processed_sigs.fetch_add(1, Ordering::SeqCst);
-                if i % 1000 == 0 {
-                    info!("Processed {} reference sigs", i);
-                }
-
-                revindex::map_hashes_colors(
-                    db.clone(),
-                    dataset_id as DatasetID,
-                    filename,
-                    threshold,
-                    &template,
-                    save_paths,
-                );
-                Some(true)
-            })
-            .count();
-    };
-
-    info!("Processed {} reference sigs", processed_sigs.into_inner());
-
-    db.compact_range(None::<&[u8]>, None::<&[u8]>);
-
-    db.flush_wal(true)?;
-
-    let cf = db.cf_handle(HASHES).unwrap();
-    db.flush_cf(&cf)?;
-
-    let cf = db.cf_handle(SIGS).unwrap();
-    db.flush_cf(&cf)?;
-
-    if colors {
-        let cf = db.cf_handle(COLORS).unwrap();
-        db.flush_cf(&cf)?;
-    }
-
-    Ok(())
-}
-
-pub fn check<P: AsRef<Path>>(
-    output: P,
-    quick: bool,
-    colors: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use byteorder::ReadBytesExt;
-    use numsep::{separate, Locale};
-
-    let (db, _, _) = if colors {
-        color_revindex::open_db(output.as_ref(), true, colors)
-    } else {
-        open_db(output.as_ref(), true, colors)
-    };
-
-    let deep_check = if colors { COLORS } else { HASHES };
-
-    let stats_for_cf = |cf_name| {
-        let cf = db.cf_handle(cf_name).unwrap();
-
-        let iter = db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
-        let mut kcount = 0;
-        let mut vcount = 0;
-        let mut vcounts = Histogram::new();
-        let mut datasets: Datasets = Default::default();
-
-        for (key, value) in iter {
-            let _k = (&key[..]).read_u64::<LittleEndian>().unwrap();
-            kcount += key.len();
-
-            //println!("Saw {} {:?}", k, Datasets::from_slice(&value));
-            vcount += value.len();
-
-            if !quick && cf_name == deep_check {
-                let v = Datasets::from_slice(&value).expect("Error with value");
-                vcounts.increment(v.len() as u64).unwrap();
-                datasets.union(v);
-            }
-            //println!("Saw {} {:?}", k, value);
-        }
-
-        info!("*** {} ***", cf_name);
-        use size::Size;
-        let ksize = Size::from_bytes(kcount);
-        let vsize = Size::from_bytes(vcount);
-        if !quick && cf_name == COLORS {
-            info!(
-                "total datasets: {}",
-                separate(datasets.len(), Locale::English)
-            );
-        }
-        info!("total keys: {}", separate(kcount / 8, Locale::English));
-
-        info!("k: {}", ksize.to_string());
-        info!("v: {}", vsize.to_string());
-
-        if !quick && kcount > 0 && cf_name == deep_check {
-            info!("max v: {}", vcounts.maximum().unwrap());
-            info!("mean v: {}", vcounts.mean().unwrap());
-            info!("stddev: {}", vcounts.stddev().unwrap());
-            info!("median v: {}", vcounts.percentile(50.0).unwrap());
-            info!("p25 v: {}", vcounts.percentile(25.0).unwrap());
-            info!("p75 v: {}", vcounts.percentile(75.0).unwrap());
-        }
-    };
-
-    stats_for_cf(HASHES);
-    if colors {
-        info!("");
-        stats_for_cf(COLORS);
-    }
-    info!("");
-    stats_for_cf(SIGS);
-
-    Ok(())
-}
-
 pub fn sig_save_to_db(
     db: Arc<DB>,
     mut search_sig: Signature,
@@ -594,4 +386,56 @@ pub fn sig_save_to_db(
         .expect("error writing bytes");
     db.put_cf(&cf_sigs, &hash_bytes[..], sig_bytes.as_slice())
         .expect("error saving sig");
+}
+
+pub fn stats_for_cf(db: Arc<DB>, cf_name: &str, deep_check: bool, quick: bool) {
+    use byteorder::ReadBytesExt;
+    use numsep::{separate, Locale};
+
+    let cf = db.cf_handle(cf_name).unwrap();
+
+    let iter = db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+    let mut kcount = 0;
+    let mut vcount = 0;
+    let mut vcounts = Histogram::new();
+    let mut datasets: Datasets = Default::default();
+
+    for (key, value) in iter {
+        let _k = (&key[..]).read_u64::<LittleEndian>().unwrap();
+        kcount += key.len();
+
+        //println!("Saw {} {:?}", k, Datasets::from_slice(&value));
+        vcount += value.len();
+
+        if !quick && deep_check {
+            let v = Datasets::from_slice(&value).expect("Error with value");
+            vcounts.increment(v.len() as u64).unwrap();
+            datasets.union(v);
+        }
+        //println!("Saw {} {:?}", k, value);
+    }
+
+    info!("*** {} ***", cf_name);
+    use size::Size;
+    let ksize = Size::from_bytes(kcount);
+    let vsize = Size::from_bytes(vcount);
+    if !quick && cf_name == COLORS {
+        info!(
+            "total datasets: {}",
+            separate(datasets.len(), Locale::English)
+        );
+    }
+    info!("total keys: {}", separate(kcount / 8, Locale::English));
+
+    info!("k: {}", ksize.to_string());
+    info!("v: {}", vsize.to_string());
+
+    if !quick && kcount > 0 && deep_check {
+        info!("max v: {}", vcounts.maximum().unwrap());
+        info!("mean v: {}", vcounts.mean().unwrap());
+        info!("stddev: {}", vcounts.stddev().unwrap());
+        info!("median v: {}", vcounts.percentile(50.0).unwrap());
+        info!("p25 v: {}", vcounts.percentile(25.0).unwrap());
+        info!("p75 v: {}", vcounts.percentile(75.0).unwrap());
+    }
 }
