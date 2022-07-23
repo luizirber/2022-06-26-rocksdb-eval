@@ -99,6 +99,85 @@ enum Commands {
         #[clap(long = "colors")]
         colors: bool,
     },
+    Gather {
+        /// Query signature
+        #[clap(parse(from_os_str))]
+        query_path: PathBuf,
+
+        /// Path to rocksdb index dir
+        #[clap(parse(from_os_str))]
+        index: PathBuf,
+
+        /// ksize
+        #[clap(short = 'k', long = "ksize", default_value = "31")]
+        ksize: u8,
+
+        /// scaled
+        #[clap(short = 's', long = "scaled", default_value = "1000")]
+        scaled: usize,
+
+        /// threshold_bp
+        #[clap(short = 't', long = "threshold_bp", default_value = "50000")]
+        threshold_bp: usize,
+
+        /// The path for output
+        #[clap(parse(from_os_str), short = 'o', long = "output")]
+        output: Option<PathBuf>,
+
+        /// search using colors
+        #[clap(long = "colors")]
+        colors: bool,
+    },
+}
+
+pub fn gather<P: AsRef<Path>>(
+    queries_file: P,
+    index: P,
+    template: Sketch,
+    threshold_bp: usize,
+    _output: Option<P>,
+    colors: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let query_sig = Signature::from_path(queries_file)?;
+
+    let mut query = None;
+    for sig in &query_sig {
+        if let Some(q) = prepare_query(sig, &template) {
+            query = Some(q);
+        }
+    }
+    let query = query.expect("Couldn't find a compatible MinHash");
+
+    let threshold = threshold_bp / query.scaled() as usize;
+
+    let db = RevIndex::open(index.as_ref(), false, colors);
+    info!("Loaded DB");
+
+    info!("Building counter");
+    let (counter, query_colors, hash_to_color) = db.prepare_gather_counters(&query);
+    // TODO: truncate on threshold?
+    info!("Counter built");
+
+    let matches = db.gather(
+        counter,
+        query_colors,
+        hash_to_color,
+        threshold,
+        &query,
+        &template,
+    )?;
+
+    info!("matches: {}", matches.len());
+    for match_ in matches {
+        println!(
+            "{} {} {}",
+            match_.name(),
+            match_.intersect_bp(),
+            match_.f_match()
+        )
+    }
+
+    Ok(())
 }
 
 pub fn search<P: AsRef<Path>>(
@@ -205,6 +284,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let template = build_template(ksize, scaled);
 
             search(query_path, index, template, threshold_bp, output, colors)?
+        }
+        Gather {
+            query_path,
+            output,
+            index,
+            threshold_bp,
+            ksize,
+            scaled,
+            colors,
+        } => {
+            let template = build_template(ksize, scaled);
+
+            gather(query_path, index, template, threshold_bp, output, colors)?
         }
     };
 

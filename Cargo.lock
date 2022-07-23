@@ -248,9 +248,9 @@ dependencies = [
 
 [[package]]
 name = "counter"
-version = "0.5.5"
+version = "0.5.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63b05d7acd00b53d97b7369c4062027ff55711db0c509f5b28d6d964a2f1ff87"
+checksum = "48388d8711a360319610960332b6a6f9fc2b5a63bba9fd10f1b7aa50677d956f"
 dependencies = [
  "num-traits",
 ]
@@ -1096,7 +1096,7 @@ checksum = "9f1341053f34bb13b5e9590afb7d94b48b48d4b87467ec28e3c238693bb553de"
 [[package]]
 name = "sourmash"
 version = "0.11.0"
-source = "git+https://github.com/sourmash-bio/sourmash?branch=lirber/rkyv_mh#d9f2749ccca21afce4f6e1c2fb2f47b2ab821c12"
+source = "git+https://github.com/sourmash-bio/sourmash?branch=lirber/rkyv_mh#5268be61c5b6f3582d344d5771810a60dca6c0d0"
 dependencies = [
  "az",
  "bytecount",

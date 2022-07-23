@@ -3,17 +3,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use byteorder::{LittleEndian, WriteBytesExt};
-use log::info;
+use log::{info, trace};
 use rayon::prelude::*;
 use rocksdb::{ColumnFamilyDescriptor, MergeOperands, Options};
 
-use sourmash::signature::Signature;
+use sourmash::index::revindex::GatherResult;
+use sourmash::signature::{Signature, SigsTrait};
 use sourmash::sketch::minhash::KmerMinHash;
 use sourmash::sketch::Sketch;
 
+use crate::color_revindex::Colors;
 use crate::prepare_query;
 use crate::{
-    sig_save_to_db, stats_for_cf, DatasetID, Datasets, SigCounter, SignatureData, DB, HASHES, SIGS,
+    sig_save_to_db, stats_for_cf, DatasetID, Datasets, HashToColor, QueryColors, SigCounter,
+    SignatureData, DB, HASHES, SIGS,
 };
 
 fn merge_datasets(
@@ -100,6 +103,48 @@ pub fn counter_for_query(db: Arc<DB>, query: &KmerMinHash) -> SigCounter {
         .collect()
 }
 
+pub fn prepare_gather_counters(
+    db: Arc<DB>,
+    query: &KmerMinHash,
+) -> (SigCounter, QueryColors, HashToColor) {
+    /*
+     TODO: build a HashToColors for query,
+           and after that a QueryColors (Color -> Datasets) mapping.
+           Loading Datasets from rocksdb for every hash takes too long.
+    */
+    let cf_hashes = db.cf_handle(HASHES).unwrap();
+    let hashes_iter = query.iter_mins().map(|hash| {
+        let mut v = vec![0_u8; 8];
+        (&mut v[..])
+            .write_u64::<LittleEndian>(*hash)
+            .expect("error writing bytes");
+        (&cf_hashes, v)
+    });
+
+    let mut query_colors: QueryColors = Default::default();
+    let mut counter: SigCounter = Default::default();
+
+    info!("Building hash_to_colors and query_colors");
+    let hash_to_colors = query
+        .iter_mins()
+        .zip(db.multi_get_cf(hashes_iter).into_iter())
+        .filter_map(|(k, r)| {
+            let raw = r.ok().unwrap_or(None);
+            if !raw.is_none() {
+                let new_vals = Datasets::from_slice(&raw.unwrap()).unwrap();
+                let color = Colors::compute_color(&new_vals);
+                query_colors.entry(color).or_insert(new_vals.clone());
+                counter.update(new_vals.into_iter());
+                Some((*k, color))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    (counter, query_colors, hash_to_colors)
+}
+
 pub fn matches_from_counter(db: Arc<DB>, counter: SigCounter, threshold: usize) -> Vec<String> {
     let cf_sigs = db.cf_handle(SIGS).unwrap();
 
@@ -120,7 +165,7 @@ pub fn matches_from_counter(db: Arc<DB>, counter: SigCounter, threshold: usize) 
 
     info!("Multi get matches");
     db.multi_get_cf(matches_iter)
-        .into_iter()
+        .into_par_iter()
         .filter_map(|r| r.ok().unwrap_or(None))
         .filter_map(
             |sigdata| match SignatureData::from_slice(&sigdata).unwrap() {
@@ -130,6 +175,120 @@ pub fn matches_from_counter(db: Arc<DB>, counter: SigCounter, threshold: usize) 
             },
         )
         .collect()
+}
+
+pub fn gather(
+    db: Arc<DB>,
+    mut counter: SigCounter,
+    query_colors: QueryColors,
+    hash_to_color: HashToColor,
+    threshold: usize,
+    orig_query: &KmerMinHash,
+    template: &Sketch,
+) -> Result<Vec<GatherResult>, Box<dyn std::error::Error>> {
+    let mut match_size = usize::max_value();
+    let mut matches = vec![];
+    let mut key_bytes = [0u8; 8];
+    let mut query = orig_query.clone();
+
+    let cf_sigs = db.cf_handle(SIGS).unwrap();
+
+    while match_size > threshold && !counter.is_empty() {
+        trace!("counter len: {}", counter.len());
+        trace!("match size: {}", match_size);
+
+        let (dataset_id, size) = counter.k_most_common_ordered(1)[0];
+        match_size = if size >= threshold { size } else { break };
+
+        (&mut key_bytes[..])
+            .write_u64::<LittleEndian>(dataset_id)
+            .expect("error writing bytes");
+
+        let match_sig = db
+            .get_cf(&cf_sigs, &key_bytes[..])
+            .ok()
+            .map(
+                |sigdata| match SignatureData::from_slice(&(sigdata.unwrap())).unwrap() {
+                    SignatureData::Empty => todo!("throw error, empty sig"),
+                    SignatureData::External(_p) => todo!("Load from external"),
+                    SignatureData::Internal(sig) => sig,
+                },
+            )
+            .expect(format!("Unknown dataset {}", dataset_id).as_ref());
+
+        let match_mh =
+            prepare_query(&match_sig, template).expect("Couldn't find a compatible MinHash");
+
+        // Calculate stats
+        let f_orig_query = match_size as f64 / orig_query.size() as f64;
+        let f_match = match_size as f64 / match_mh.size() as f64;
+        let name = match_sig.name();
+        let unique_intersect_bp = match_mh.scaled() as usize * match_size;
+        let gather_result_rank = matches.len();
+
+        let (intersect_orig, _) = match_mh.intersection_size(&orig_query)?;
+        let intersect_bp = (match_mh.scaled() as u64 * intersect_orig) as usize;
+
+        let f_unique_to_query = intersect_orig as f64 / orig_query.size() as f64;
+        let match_ = match_sig.clone();
+
+        // TODO: all of these
+        let filename = "".into();
+        let f_unique_weighted = 0.;
+        let average_abund = 0;
+        let median_abund = 0;
+        let std_abund = 0;
+        let md5 = "".into();
+        let f_match_orig = 0.;
+        let remaining_bp = 0;
+
+        let result = GatherResult::builder()
+            .intersect_bp(intersect_bp)
+            .f_orig_query(f_orig_query)
+            .f_match(f_match)
+            .f_unique_to_query(f_unique_to_query)
+            .f_unique_weighted(f_unique_weighted)
+            .average_abund(average_abund)
+            .median_abund(median_abund)
+            .std_abund(std_abund)
+            .filename(filename)
+            .name(name)
+            .md5(md5)
+            .match_(match_)
+            .f_match_orig(f_match_orig)
+            .unique_intersect_bp(unique_intersect_bp)
+            .gather_result_rank(gather_result_rank)
+            .remaining_bp(remaining_bp)
+            .build();
+        matches.push(result);
+
+        trace!("Preparing counter for next round");
+        // Prepare counter for finding the next match by decrementing
+        // all hashes found in the current match in other datasets
+        query.remove_many(match_mh.to_vec().as_slice())?;
+
+        // TODO: Use HashesToColors here instead. If not initialized,
+        //       build it.
+        match_mh
+            .iter_mins()
+            .filter_map(|hash| hash_to_color.get(hash))
+            .flat_map(|color| {
+                // TODO: remove this clone
+                query_colors.get(color).unwrap().clone().into_iter()
+            })
+            .for_each(|dataset| {
+                // TODO: collect the flat_map into a Counter, and remove more
+                //       than one at a time...
+                counter.entry(dataset).and_modify(|e| {
+                    if *e > 0 {
+                        *e -= 1
+                    }
+                });
+            });
+
+        counter.remove(&dataset_id);
+    }
+    Ok(matches)
 }
 
 pub fn index(

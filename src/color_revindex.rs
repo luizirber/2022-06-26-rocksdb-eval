@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use byteorder::{LittleEndian, WriteBytesExt};
 use log::{debug, error, info, trace};
+use rayon::prelude::*;
 use rkyv::{Archive, Deserialize, Serialize};
 use rocksdb::{ColumnFamilyDescriptor, MergeOperands, Options};
 
@@ -345,7 +346,7 @@ impl ColorRevIndex {
 
         let processed_sigs = AtomicUsize::new(0);
         index_sigs
-            .iter()
+            .par_iter()
             .enumerate()
             .for_each(|(dataset_id, filename)| {
                 let i = processed_sigs.fetch_add(1, Ordering::SeqCst);
@@ -369,6 +370,7 @@ impl ColorRevIndex {
 
         self.compact();
         self.flush().unwrap();
+
         finished.store(true, Ordering::Relaxed);
 
         if let Err(e) = color_writer.join() {
@@ -412,10 +414,10 @@ impl ColorRevIndex {
 }
 
 use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
-type Color = u64;
+pub type Color = u64;
 
 #[derive(Default, Debug, PartialEq, Clone, Archive, Serialize, Deserialize)]
-struct Colors;
+pub struct Colors;
 
 impl Colors {
     /// Given a color and a new idx, return an updated color
@@ -507,7 +509,7 @@ impl Colors {
         }
     }
 
-    fn compute_color(idxs: &Datasets) -> Color {
+    pub fn compute_color(idxs: &Datasets) -> Color {
         let s = BuildHasherDefault::<twox_hash::Xxh3Hash128>::default();
         let mut hasher = s.build_hasher();
         /*
@@ -527,18 +529,26 @@ impl Colors {
 
         let mut colors: std::collections::HashSet<Color> = Default::default();
 
+        debug!("Collecting colors");
         let iter = db.iterator_cf(&cf_hashes, rocksdb::IteratorMode::Start);
         for (_, value) in iter {
             let color = (&value[..]).read_u64::<LittleEndian>().unwrap();
             colors.insert(color);
         }
 
+        debug!("Deleting unused colors");
+        let mut total_deletions: usize = 0;
         let iter = db.iterator_cf(&cf_colors, rocksdb::IteratorMode::Start);
         for (key, _) in iter {
             let k = (&key[..]).read_u64::<LittleEndian>().unwrap();
             if !colors.contains(&k) {
                 db.delete_cf(&cf_colors, &key[..]).unwrap();
+                total_deletions += 1;
+                if total_deletions % 1000 == 0 {
+                    debug!("Deleted {} colors", total_deletions);
+                }
             }
         }
+        debug!("Finished compression");
     }
 }

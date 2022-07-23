@@ -1,7 +1,7 @@
 pub mod color_revindex;
 pub mod revindex;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -13,15 +13,20 @@ use log::info;
 use rkyv::{Archive, Deserialize, Serialize};
 use rocksdb::Options;
 
+use sourmash::index::revindex::GatherResult;
 use sourmash::signature::{Signature, SigsTrait};
 use sourmash::sketch::minhash::{max_hash_for_scaled, KmerMinHash};
 use sourmash::sketch::Sketch;
+
+use crate::color_revindex::Color;
 
 //type DB = rocksdb::DBWithThreadMode<rocksdb::SingleThreaded>;
 pub type DB = rocksdb::DBWithThreadMode<rocksdb::MultiThreaded>;
 
 pub type DatasetID = u64;
 type SigCounter = counter::Counter<DatasetID>;
+type QueryColors = HashMap<Color, Datasets>;
+type HashToColor = HashMap<DatasetID, Color>;
 
 pub const HASHES: &str = "hashes";
 pub const SIGS: &str = "signatures";
@@ -39,10 +44,21 @@ impl RevIndex {
             Self::Plain(db) => revindex::counter_for_query(db.clone(), query),
         }
     }
+
     pub fn matches_from_counter(self, counter: SigCounter, threshold: usize) -> Vec<String> {
         match self {
             Self::Color(db) => db.matches_from_counter(counter, threshold),
             Self::Plain(db) => revindex::matches_from_counter(db.clone(), counter, threshold),
+        }
+    }
+
+    pub fn prepare_gather_counters(
+        &self,
+        query: &KmerMinHash,
+    ) -> (SigCounter, QueryColors, HashToColor) {
+        match self {
+            Self::Color(_db) => todo!(), //db.prepare_gather_counters(query),
+            Self::Plain(db) => revindex::prepare_gather_counters(db.clone(), query),
         }
     }
 
@@ -96,6 +112,28 @@ impl RevIndex {
             color_revindex::ColorRevIndex::open(index.as_ref(), read_only)
         } else {
             open_db(index.as_ref(), read_only)
+        }
+    }
+    pub fn gather(
+        &self,
+        counter: SigCounter,
+        query_colors: QueryColors,
+        hash_to_color: HashToColor,
+        threshold: usize,
+        query: &KmerMinHash,
+        template: &Sketch,
+    ) -> Result<Vec<GatherResult>, Box<dyn std::error::Error>> {
+        match self {
+            Self::Color(_db) => todo!(),
+            Self::Plain(db) => revindex::gather(
+                db.clone(),
+                counter,
+                query_colors,
+                hash_to_color,
+                threshold,
+                query,
+                template,
+            ),
         }
     }
 }
