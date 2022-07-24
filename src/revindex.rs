@@ -9,7 +9,7 @@ use rocksdb::{ColumnFamilyDescriptor, MergeOperands, Options};
 
 use sourmash::index::revindex::GatherResult;
 use sourmash::signature::{Signature, SigsTrait};
-use sourmash::sketch::minhash::{KmerMinHash, KmerMinHashBTree};
+use sourmash::sketch::minhash::KmerMinHash;
 use sourmash::sketch::Sketch;
 
 use crate::color_revindex::Colors;
@@ -107,11 +107,6 @@ pub fn prepare_gather_counters(
     db: Arc<DB>,
     query: &KmerMinHash,
 ) -> (SigCounter, QueryColors, HashToColor) {
-    /*
-     TODO: build a HashToColors for query,
-           and after that a QueryColors (Color -> Datasets) mapping.
-           Loading Datasets from rocksdb for every hash takes too long.
-    */
     let cf_hashes = db.cf_handle(HASHES).unwrap();
     let hashes_iter = query.iter_mins().map(|hash| {
         let mut v = vec![0_u8; 8];
@@ -121,6 +116,11 @@ pub fn prepare_gather_counters(
         (&cf_hashes, v)
     });
 
+    /*
+     build a HashToColors for query,
+     and a QueryColors (Color -> Datasets) mapping.
+     Loading Datasets from rocksdb for every hash takes too long.
+    */
     let mut query_colors: QueryColors = Default::default();
     let mut counter: SigCounter = Default::default();
 
@@ -189,7 +189,7 @@ pub fn gather(
     let mut match_size = usize::max_value();
     let mut matches = vec![];
     let mut key_bytes = [0u8; 8];
-    let mut query: KmerMinHashBTree = orig_query.clone().into();
+    //let mut query: KmerMinHashBTree = orig_query.clone().into();
 
     let cf_sigs = db.cf_handle(SIGS).unwrap();
 
@@ -231,6 +231,7 @@ pub fn gather(
 
         let f_unique_to_query = intersect_orig as f64 / orig_query.size() as f64;
         let match_ = match_sig.clone();
+        let md5 = match_sig.md5sum();
 
         // TODO: all of these
         let filename = "".into();
@@ -238,7 +239,6 @@ pub fn gather(
         let average_abund = 0;
         let median_abund = 0;
         let std_abund = 0;
-        let md5 = "".into();
         let f_match_orig = 0.;
         let remaining_bp = 0;
 
@@ -265,7 +265,8 @@ pub fn gather(
         trace!("Preparing counter for next round");
         // Prepare counter for finding the next match by decrementing
         // all hashes found in the current match in other datasets
-        query.remove_many(match_mh.to_vec().as_slice())?;
+        // TODO: not used at the moment, so just skip.
+        //query.remove_many(match_mh.to_vec().as_slice())?;
 
         // TODO: Use HashesToColors here instead. If not initialized,
         //       build it.
