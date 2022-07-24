@@ -9,7 +9,7 @@ use rocksdb::{ColumnFamilyDescriptor, MergeOperands, Options};
 
 use sourmash::index::revindex::GatherResult;
 use sourmash::signature::{Signature, SigsTrait};
-use sourmash::sketch::minhash::KmerMinHash;
+use sourmash::sketch::minhash::{KmerMinHash, KmerMinHashBTree};
 use sourmash::sketch::Sketch;
 
 use crate::color_revindex::Colors;
@@ -189,7 +189,7 @@ pub fn gather(
     let mut match_size = usize::max_value();
     let mut matches = vec![];
     let mut key_bytes = [0u8; 8];
-    let mut query = orig_query.clone();
+    let mut query: KmerMinHashBTree = orig_query.clone().into();
 
     let cf_sigs = db.cf_handle(SIGS).unwrap();
 

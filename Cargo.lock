@@ -1096,7 +1096,7 @@ checksum = "9f1341053f34bb13b5e9590afb7d94b48b48d4b87467ec28e3c238693bb553de"
 [[package]]
 name = "sourmash"
 version = "0.11.0"
-source = "git+https://github.com/sourmash-bio/sourmash?branch=lirber/rkyv_mh#5268be61c5b6f3582d344d5771810a60dca6c0d0"
+source = "git+https://github.com/sourmash-bio/sourmash?branch=lirber/rkyv_mh#47b6fce9ba087d4bab5d4b1ed6cc48deee3af422"
 dependencies = [
  "az",
  "bytecount",
