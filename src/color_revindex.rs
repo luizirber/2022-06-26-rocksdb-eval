@@ -91,39 +91,36 @@ impl ColorRevIndex {
         let (tx_merge, rx_merge) = flume::unbounded();
         let (tx_colors, rx_colors) = flume::unbounded();
 
-        let merge_colors =
-            move |_: &[u8], existing_val: Option<&[u8]>, operands: &MergeOperands| {
-                trace!("triggering merge colors");
-                use byteorder::ReadBytesExt;
+        let merge_colors = move |_: &[u8],
+                                 existing_val: Option<&[u8]>,
+                                 operands: &MergeOperands| {
+            trace!("triggering merge colors");
+            use byteorder::ReadBytesExt;
 
-                let current_color = if let Some(c) = existing_val {
-                    Some((&c[..]).read_u64::<LittleEndian>().unwrap())
-                } else {
-                    None
-                };
+            let current_color = existing_val.map(|c| (&c[..]).read_u64::<LittleEndian>().unwrap());
 
-                let mut datasets: Datasets = Default::default();
+            let mut datasets: Datasets = Default::default();
 
-                for op in operands {
-                    let new_vals = Datasets::from_slice(op).unwrap();
-                    datasets.union(new_vals);
-                }
+            for op in operands {
+                let new_vals = Datasets::from_slice(op).unwrap();
+                datasets.union(new_vals);
+            }
 
-                trace!("sending current_color {:?}", current_color);
-                tx_merge
-                    .send((current_color, datasets))
-                    .expect("Error sending current_color");
+            trace!("sending current_color {:?}", current_color);
+            tx_merge
+                .send((current_color, datasets))
+                .expect("Error sending current_color");
 
-                trace!("receiving new color for current_color {:?}", current_color);
-                let new_color = rx_colors.recv().expect("Error receiving new color");
-                trace!("received new_color {}", new_color);
-                let mut color_bytes = vec![0u8; 8];
-                (&mut color_bytes[..])
-                    .write_u64::<LittleEndian>(new_color)
-                    .expect("error writing bytes");
+            trace!("receiving new color for current_color {:?}", current_color);
+            let new_color = rx_colors.recv().expect("Error receiving new color");
+            trace!("received new_color {}", new_color);
+            let mut color_bytes = vec![0u8; 8];
+            (&mut color_bytes[..])
+                .write_u64::<LittleEndian>(new_color)
+                .expect("error writing bytes");
 
-                Some(color_bytes)
-            };
+            Some(color_bytes)
+        };
 
         let mut cfopts = Options::default();
         cfopts.set_max_write_buffer_number(16);
@@ -358,7 +355,7 @@ impl ColorRevIndex {
                     dataset_id as DatasetID,
                     filename,
                     threshold,
-                    &template,
+                    template,
                     save_paths,
                 );
             });

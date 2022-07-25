@@ -96,9 +96,9 @@ impl RevIndex {
 
     pub fn open(index: &Path, read_only: bool, colors: bool) -> Self {
         if colors {
-            color_revindex::ColorRevIndex::open(index.as_ref(), read_only)
+            color_revindex::ColorRevIndex::open(index, read_only)
         } else {
-            revindex::RevIndex::open(index.as_ref(), read_only)
+            revindex::RevIndex::open(index, read_only)
         }
     }
 
@@ -278,12 +278,12 @@ impl Extend<DatasetID> for Datasets {
 
 impl Datasets {
     pub fn new(vals: &[DatasetID]) -> Self {
-        if vals.len() == 0 {
+        if vals.is_empty() {
             Self::Empty
         } else if vals.len() == 1 {
             Self::Unique(vals[0])
         } else {
-            Self::Many(BTreeSet::from_iter(vals.into_iter().cloned()))
+            Self::Many(BTreeSet::from_iter(vals.iter().cloned()))
         }
     }
 
@@ -341,6 +341,10 @@ impl Datasets {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn contains(&self, value: &DatasetID) -> bool {
         match self {
             Self::Empty => false,
@@ -357,7 +361,7 @@ pub fn sig_save_to_db(
     size: u64,
     threshold: f64,
     save_paths: bool,
-    filename: &PathBuf,
+    filename: &Path,
     dataset_id: u64,
 ) {
     // Save signature to DB

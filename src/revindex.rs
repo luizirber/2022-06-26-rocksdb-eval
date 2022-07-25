@@ -170,15 +170,15 @@ impl RevIndex {
             .zip(self.db.multi_get_cf(hashes_iter).into_iter())
             .filter_map(|(k, r)| {
                 let raw = r.ok().unwrap_or(None);
-                if !raw.is_none() {
-                    let new_vals = Datasets::from_slice(&raw.unwrap()).unwrap();
+                raw.map(|raw| {
+                    let new_vals = Datasets::from_slice(&raw).unwrap();
                     let color = Colors::compute_color(&new_vals);
-                    query_colors.entry(color).or_insert(new_vals.clone());
+                    query_colors
+                        .entry(color)
+                        .or_insert_with(|| new_vals.clone());
                     counter.update(new_vals.into_iter());
-                    Some((*k, color))
-                } else {
-                    None
-                }
+                    (*k, color)
+                })
             })
             .collect();
 
@@ -256,7 +256,7 @@ impl RevIndex {
                         SignatureData::Internal(sig) => sig,
                     },
                 )
-                .expect(format!("Unknown dataset {}", dataset_id).as_ref());
+                .unwrap_or_else(|| panic!("Unknown dataset {}", dataset_id));
 
             let match_mh =
                 prepare_query(&match_sig, template).expect("Couldn't find a compatible MinHash");
@@ -268,7 +268,7 @@ impl RevIndex {
             let unique_intersect_bp = match_mh.scaled() as usize * match_size;
             let gather_result_rank = matches.len();
 
-            let (intersect_orig, _) = match_mh.intersection_size(&orig_query)?;
+            let (intersect_orig, _) = match_mh.intersection_size(orig_query)?;
             let intersect_bp = (match_mh.scaled() as u64 * intersect_orig) as usize;
 
             let f_unique_to_query = intersect_orig as f64 / orig_query.size() as f64;
@@ -356,7 +356,7 @@ impl RevIndex {
                     dataset_id as DatasetID,
                     filename,
                     threshold,
-                    &template,
+                    template,
                     save_paths,
                 );
             });
