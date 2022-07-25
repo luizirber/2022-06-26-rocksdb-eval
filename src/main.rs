@@ -130,7 +130,7 @@ enum Commands {
     },
 }
 
-pub fn gather<P: AsRef<Path>>(
+fn gather<P: AsRef<Path>>(
     queries_file: P,
     index: P,
     template: Sketch,
@@ -180,7 +180,7 @@ pub fn gather<P: AsRef<Path>>(
     Ok(())
 }
 
-pub fn search<P: AsRef<Path>>(
+fn search<P: AsRef<Path>>(
     queries_file: P,
     index: P,
     template: Sketch,
@@ -214,7 +214,8 @@ pub fn search<P: AsRef<Path>>(
 
     Ok(())
 }
-pub fn index<P: AsRef<Path>>(
+
+fn index<P: AsRef<Path>>(
     siglist: P,
     template: Sketch,
     threshold: f64,
@@ -232,7 +233,7 @@ pub fn index<P: AsRef<Path>>(
     Ok(())
 }
 
-pub fn check<P: AsRef<Path>>(
+fn check<P: AsRef<Path>>(
     output: P,
     quick: bool,
     colors: bool,

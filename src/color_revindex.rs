@@ -168,7 +168,7 @@ impl ColorRevIndex {
         })
     }
 
-    pub fn map_hashes_colors(
+    fn map_hashes_colors(
         &self,
         dataset_id: DatasetID,
         filename: &PathBuf,

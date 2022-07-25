@@ -20,16 +20,16 @@ use sourmash::sketch::Sketch;
 use crate::color_revindex::Color;
 
 //type DB = rocksdb::DBWithThreadMode<rocksdb::SingleThreaded>;
-pub type DB = rocksdb::DBWithThreadMode<rocksdb::MultiThreaded>;
+type DB = rocksdb::DBWithThreadMode<rocksdb::MultiThreaded>;
 
-pub type DatasetID = u64;
+type DatasetID = u64;
 type SigCounter = counter::Counter<DatasetID>;
 type QueryColors = HashMap<Color, Datasets>;
 type HashToColor = HashMap<DatasetID, Color>;
 
-pub const HASHES: &str = "hashes";
-pub const SIGS: &str = "signatures";
-pub const COLORS: &str = "colors";
+const HASHES: &str = "hashes";
+const SIGS: &str = "signatures";
+const COLORS: &str = "colors";
 
 pub enum RevIndex {
     Color(color_revindex::ColorRevIndex),
@@ -126,7 +126,7 @@ impl RevIndex {
 }
 
 #[derive(Debug, PartialEq, Clone, Archive, Serialize, Deserialize)]
-pub enum SignatureData {
+enum SignatureData {
     Empty,
     Internal(Signature),
     External(String),
@@ -139,7 +139,7 @@ impl Default for SignatureData {
 }
 
 impl SignatureData {
-    pub fn from_slice(slice: &[u8]) -> Option<Self> {
+    fn from_slice(slice: &[u8]) -> Option<Self> {
         // TODO: avoid the aligned vec allocation here
         let mut vec = rkyv::AlignedVec::new();
         vec.extend_from_slice(slice);
@@ -148,7 +148,7 @@ impl SignatureData {
         Some(inner)
     }
 
-    pub fn as_bytes(&self) -> Option<Vec<u8>> {
+    fn as_bytes(&self) -> Option<Vec<u8>> {
         let bytes = rkyv::to_bytes::<_, 256>(self).unwrap();
         Some(bytes.into_vec())
 
@@ -163,7 +163,7 @@ impl SignatureData {
     }
 }
 
-pub fn check_compatible_downsample(
+fn check_compatible_downsample(
     me: &KmerMinHash,
     other: &KmerMinHash,
 ) -> Result<(), sourmash::Error> {
@@ -277,7 +277,7 @@ impl Extend<DatasetID> for Datasets {
 }
 
 impl Datasets {
-    pub fn new(vals: &[DatasetID]) -> Self {
+    fn new(vals: &[DatasetID]) -> Self {
         if vals.is_empty() {
             Self::Empty
         } else if vals.len() == 1 {
@@ -287,7 +287,7 @@ impl Datasets {
         }
     }
 
-    pub fn from_slice(slice: &[u8]) -> Option<Self> {
+    fn from_slice(slice: &[u8]) -> Option<Self> {
         // TODO: avoid the aligned vec allocation here
         let mut vec = rkyv::AlignedVec::new();
         vec.extend_from_slice(slice);
@@ -296,7 +296,7 @@ impl Datasets {
         Some(inner)
     }
 
-    pub fn as_bytes(&self) -> Option<Vec<u8>> {
+    fn as_bytes(&self) -> Option<Vec<u8>> {
         let bytes = rkyv::to_bytes::<_, 256>(self).unwrap();
         Some(bytes.into_vec())
 
@@ -310,7 +310,7 @@ impl Datasets {
         */
     }
 
-    pub fn union(&mut self, other: Datasets) {
+    fn union(&mut self, other: Datasets) {
         match self {
             Datasets::Empty => match other {
                 Datasets::Empty => (),
@@ -333,7 +333,7 @@ impl Datasets {
         }
     }
 
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         match self {
             Self::Empty => 0,
             Self::Unique(_) => 1,
@@ -341,11 +341,7 @@ impl Datasets {
         }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    pub fn contains(&self, value: &DatasetID) -> bool {
+    fn contains(&self, value: &DatasetID) -> bool {
         match self {
             Self::Empty => false,
             Self::Unique(v) => v == value,
@@ -354,7 +350,7 @@ impl Datasets {
     }
 }
 
-pub fn sig_save_to_db(
+fn sig_save_to_db(
     db: Arc<DB>,
     mut search_sig: Signature,
     search_mh: KmerMinHash,
@@ -385,7 +381,7 @@ pub fn sig_save_to_db(
         .expect("error saving sig");
 }
 
-pub fn stats_for_cf(db: Arc<DB>, cf_name: &str, deep_check: bool, quick: bool) {
+fn stats_for_cf(db: Arc<DB>, cf_name: &str, deep_check: bool, quick: bool) {
     use byteorder::ReadBytesExt;
     use numsep::{separate, Locale};
 

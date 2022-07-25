@@ -74,7 +74,7 @@ impl RevIndex {
         crate::RevIndex::Plain(Self { db })
     }
 
-    pub fn map_hashes_colors(
+    fn map_hashes_colors(
         &self,
         dataset_id: DatasetID,
         filename: &PathBuf,
@@ -388,7 +388,7 @@ impl RevIndex {
     }
 }
 
-pub fn cf_descriptors() -> Vec<ColumnFamilyDescriptor> {
+fn cf_descriptors() -> Vec<ColumnFamilyDescriptor> {
     let mut cfopts = Options::default();
     cfopts.set_max_write_buffer_number(16);
     cfopts.set_merge_operator_associative("datasets operator", merge_datasets);
