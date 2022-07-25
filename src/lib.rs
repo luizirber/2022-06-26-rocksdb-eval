@@ -11,7 +11,6 @@ use byteorder::{LittleEndian, WriteBytesExt};
 use histogram::Histogram;
 use log::info;
 use rkyv::{Archive, Deserialize, Serialize};
-use rocksdb::Options;
 
 use sourmash::index::revindex::GatherResult;
 use sourmash::signature::{Signature, SigsTrait};
@@ -34,21 +33,21 @@ pub const COLORS: &str = "colors";
 
 pub enum RevIndex {
     Color(color_revindex::ColorRevIndex),
-    Plain(Arc<DB>),
+    Plain(revindex::RevIndex),
 }
 
 impl RevIndex {
     pub fn counter_for_query(&self, query: &KmerMinHash) -> SigCounter {
         match self {
             Self::Color(db) => db.counter_for_query(query),
-            Self::Plain(db) => revindex::counter_for_query(db.clone(), query),
+            Self::Plain(db) => db.counter_for_query(query),
         }
     }
 
     pub fn matches_from_counter(self, counter: SigCounter, threshold: usize) -> Vec<String> {
         match self {
             Self::Color(db) => db.matches_from_counter(counter, threshold),
-            Self::Plain(db) => revindex::matches_from_counter(db.clone(), counter, threshold),
+            Self::Plain(db) => db.matches_from_counter(counter, threshold),
         }
     }
 
@@ -58,7 +57,7 @@ impl RevIndex {
     ) -> (SigCounter, QueryColors, HashToColor) {
         match self {
             Self::Color(_db) => todo!(), //db.prepare_gather_counters(query),
-            Self::Plain(db) => revindex::prepare_gather_counters(db.clone(), query),
+            Self::Plain(db) => db.prepare_gather_counters(query),
         }
     }
 
@@ -71,39 +70,27 @@ impl RevIndex {
     ) {
         match self {
             Self::Color(db) => db.index(index_sigs, template, threshold, save_paths),
-            Self::Plain(db) => {
-                revindex::index(db.clone(), index_sigs, template, threshold, save_paths)
-            }
+            Self::Plain(db) => db.index(index_sigs, template, threshold, save_paths),
         }
     }
 
     pub fn compact(&self) {
         match self {
             Self::Color(db) => db.compact(),
-            Self::Plain(db) => db.compact_range(None::<&[u8]>, None::<&[u8]>),
+            Self::Plain(db) => db.compact(),
         };
     }
 
     pub fn flush(&self) -> Result<(), Box<dyn std::error::Error>> {
         match self {
             Self::Color(db) => db.flush(),
-            Self::Plain(db) => {
-                db.flush_wal(true)?;
-
-                let cf = db.cf_handle(HASHES).unwrap();
-                db.flush_cf(&cf)?;
-
-                let cf = db.cf_handle(SIGS).unwrap();
-                db.flush_cf(&cf)?;
-
-                Ok(())
-            }
+            Self::Plain(db) => db.flush(),
         }
     }
     pub fn check(&self, quick: bool) {
         match self {
             Self::Color(db) => db.check(quick),
-            Self::Plain(db) => revindex::check(db.clone(), quick),
+            Self::Plain(db) => db.check(quick),
         }
     }
 
@@ -111,9 +98,10 @@ impl RevIndex {
         if colors {
             color_revindex::ColorRevIndex::open(index.as_ref(), read_only)
         } else {
-            open_db(index.as_ref(), read_only)
+            revindex::RevIndex::open(index.as_ref(), read_only)
         }
     }
+
     pub fn gather(
         &self,
         counter: SigCounter,
@@ -125,8 +113,7 @@ impl RevIndex {
     ) -> Result<Vec<GatherResult>, Box<dyn std::error::Error>> {
         match self {
             Self::Color(_db) => todo!(),
-            Self::Plain(db) => revindex::gather(
-                db.clone(),
+            Self::Plain(db) => db.gather(
                 counter,
                 query_colors,
                 hash_to_color,
@@ -136,38 +123,6 @@ impl RevIndex {
             ),
         }
     }
-}
-
-pub fn open_db(path: &Path, read_only: bool) -> RevIndex {
-    let mut opts = Options::default();
-    opts.set_max_open_files(1000);
-
-    // Updated defaults from
-    // https://github.com/facebook/rocksdb/wiki/Setup-Options-and-Basic-Tuning#other-general-options
-    opts.set_bytes_per_sync(1048576);
-    let mut block_opts = rocksdb::BlockBasedOptions::default();
-    block_opts.set_block_size(16 * 1024);
-    block_opts.set_cache_index_and_filter_blocks(true);
-    block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
-    block_opts.set_format_version(5);
-    opts.set_block_based_table_factory(&block_opts);
-    // End of updated defaults
-
-    if !read_only {
-        opts.create_if_missing(true);
-        opts.create_missing_column_families(true);
-    }
-
-    // prepare column family descriptors
-    let cfs = revindex::cf_descriptors();
-
-    let db = if read_only {
-        Arc::new(DB::open_cf_descriptors_read_only(&opts, path, cfs, false).unwrap())
-    } else {
-        Arc::new(DB::open_cf_descriptors(&opts, path, cfs).unwrap())
-    };
-
-    RevIndex::Plain(db)
 }
 
 #[derive(Debug, PartialEq, Clone, Archive, Serialize, Deserialize)]
