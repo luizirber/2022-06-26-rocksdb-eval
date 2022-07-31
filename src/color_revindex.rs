@@ -44,7 +44,7 @@ fn merge_colors(
 
 #[derive(Debug, Clone)]
 pub struct ColorRevIndex {
-    db: Arc<DB>,
+    pub(crate) db: Arc<DB>,
     rx_merge: flume::Receiver<(Option<Color>, Datasets)>,
     tx_colors: flume::Sender<Color>,
 }

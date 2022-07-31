@@ -70,6 +70,15 @@ enum Commands {
         #[clap(long = "colors")]
         colors: bool,
     },
+    Convert {
+        /// The path for the input DB
+        #[clap(parse(from_os_str))]
+        input: PathBuf,
+
+        /// The path for the output DB
+        #[clap(parse(from_os_str))]
+        output: PathBuf,
+    },
     Search {
         /// Query signature
         #[clap(parse(from_os_str))]
@@ -233,6 +242,19 @@ fn index<P: AsRef<Path>>(
     Ok(())
 }
 
+fn convert<P: AsRef<Path>>(input: P, output: P) -> Result<(), Box<dyn std::error::Error>> {
+    info!("Opening DB");
+    let db = RevIndex::open(input.as_ref(), false, false);
+
+    info!("Opening DB");
+    let output_db = RevIndex::open(output.as_ref(), false, true);
+
+    db.convert(output_db)?;
+
+    info!("Finished conversion");
+    Ok(())
+}
+
 fn check<P: AsRef<Path>>(
     output: P,
     quick: bool,
@@ -273,6 +295,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             quick,
             colors,
         } => check(output, quick, colors)?,
+        Convert { input, output } => convert(input, output)?,
         Search {
             query_path,
             output,

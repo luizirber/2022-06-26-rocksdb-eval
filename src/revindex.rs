@@ -386,6 +386,45 @@ impl RevIndex {
 
         Ok(())
     }
+
+    pub fn convert(&self, output_db: crate::RevIndex) -> Result<(), Box<dyn std::error::Error>> {
+        if let crate::RevIndex::Color(db) = output_db {
+            let other_db = db.db;
+
+            let cf_hashes = self.db.cf_handle(HASHES).unwrap();
+
+            info!("start converting colors");
+            let mut color_bytes = [0u8; 8];
+            let iter = self
+                .db
+                .iterator_cf(&cf_hashes, rocksdb::IteratorMode::Start);
+            for (key, value) in iter {
+                let datasets = Datasets::from_slice(&value).unwrap();
+                let new_idx: Vec<_> = datasets.into_iter().collect();
+                let new_color = Colors::update(other_db.clone(), None, new_idx.as_slice()).unwrap();
+
+                (&mut color_bytes[..])
+                    .write_u64::<LittleEndian>(new_color)
+                    .expect("error writing bytes");
+                other_db
+                    .put_cf(&cf_hashes, &key[..], &color_bytes[..])
+                    .unwrap();
+            }
+            info!("finished converting colors");
+
+            info!("copying sigs to output");
+            let cf_sigs = self.db.cf_handle(SIGS).unwrap();
+            let iter = self.db.iterator_cf(&cf_sigs, rocksdb::IteratorMode::Start);
+            for (key, value) in iter {
+                other_db.put_cf(&cf_sigs, &key[..], &value[..]).unwrap();
+            }
+            info!("finished copying sigs to output");
+
+            Ok(())
+        } else {
+            todo!()
+        }
+    }
 }
 
 fn cf_descriptors() -> Vec<ColumnFamilyDescriptor> {

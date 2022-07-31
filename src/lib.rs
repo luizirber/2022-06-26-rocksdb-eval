@@ -87,6 +87,14 @@ impl RevIndex {
             Self::Plain(db) => db.flush(),
         }
     }
+
+    pub fn convert(&self, output_db: RevIndex) -> Result<(), Box<dyn std::error::Error>> {
+        match self {
+            Self::Color(db) => todo!(),
+            Self::Plain(db) => db.convert(output_db),
+        }
+    }
+
     pub fn check(&self, quick: bool) {
         match self {
             Self::Color(db) => db.check(quick),
@@ -260,7 +268,13 @@ impl Extend<DatasetID> for Datasets {
     where
         T: IntoIterator<Item = DatasetID>,
     {
-        for value in iter {
+        if let Self::Many(v) = self {
+            v.extend(iter);
+            return;
+        }
+
+        let mut it = iter.into_iter();
+        while let Some(value) = it.next() {
             match self {
                 Self::Empty => *self = Datasets::Unique(value),
                 Self::Unique(v) => {
@@ -269,7 +283,8 @@ impl Extend<DatasetID> for Datasets {
                     }
                 }
                 Self::Many(v) => {
-                    v.insert(value);
+                    v.extend(it);
+                    return;
                 }
             }
         }
