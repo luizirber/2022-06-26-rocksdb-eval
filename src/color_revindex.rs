@@ -49,6 +49,14 @@ pub struct ColorRevIndex {
     tx_colors: flume::Sender<Color>,
 }
 
+/* TODO: need the repair_cf variant, not available in rocksdb-rust yet
+pub fn repair(path: &Path) {
+    let opts = db_options();
+
+    DB::repair(&opts, path).unwrap()
+}
+*/
+
 impl ColorRevIndex {
     fn merge_datasets(
         _: &[u8],
@@ -69,23 +77,11 @@ impl ColorRevIndex {
     }
 
     pub fn open(path: &Path, read_only: bool) -> RevIndex {
-        let mut opts = Options::default();
-        opts.set_max_open_files(1000);
-
-        // Updated defaults from
-        // https://github.com/facebook/rocksdb/wiki/Setup-Options-and-Basic-Tuning#other-general-options
-        opts.set_bytes_per_sync(1048576);
-        let mut block_opts = rocksdb::BlockBasedOptions::default();
-        block_opts.set_block_size(16 * 1024);
-        block_opts.set_cache_index_and_filter_blocks(true);
-        block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
-        block_opts.set_format_version(5);
-        opts.set_block_based_table_factory(&block_opts);
-        // End of updated defaults
+        let mut opts = crate::RevIndex::db_options();
 
         if !read_only {
             opts.create_if_missing(true);
-            opts.create_missing_column_families(true);
+            //opts.create_missing_column_families(true);
         }
 
         let (tx_merge, rx_merge) = flume::unbounded();

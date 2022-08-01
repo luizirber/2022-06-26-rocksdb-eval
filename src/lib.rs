@@ -37,6 +37,16 @@ pub enum RevIndex {
 }
 
 impl RevIndex {
+    /* TODO: need the repair_cf variant, not available in rocksdb-rust yet
+        pub fn repair(index: &Path, colors: bool) {
+            if colors {
+                color_revindex::repair(index);
+            } else {
+                revindex::repair(index);
+            }
+        }
+    */
+
     pub fn counter_for_query(&self, query: &KmerMinHash) -> SigCounter {
         match self {
             Self::Color(db) => db.counter_for_query(query),
@@ -108,6 +118,24 @@ impl RevIndex {
         } else {
             revindex::RevIndex::open(index, read_only)
         }
+    }
+
+    fn db_options() -> rocksdb::Options {
+        let mut opts = rocksdb::Options::default();
+        opts.set_max_open_files(500);
+
+        // Updated defaults from
+        // https://github.com/facebook/rocksdb/wiki/Setup-Options-and-Basic-Tuning#other-general-options
+        opts.set_bytes_per_sync(1048576);
+        let mut block_opts = rocksdb::BlockBasedOptions::default();
+        block_opts.set_block_size(16 * 1024);
+        block_opts.set_cache_index_and_filter_blocks(true);
+        block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
+        block_opts.set_format_version(5);
+        opts.set_block_based_table_factory(&block_opts);
+        // End of updated defaults
+
+        opts
     }
 
     pub fn gather(

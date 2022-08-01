@@ -57,6 +57,17 @@ enum Commands {
         #[clap(long = "colors")]
         colors: bool,
     },
+    /* TODO: need the repair_cf variant, not available in rocksdb-rust yet
+        Repair {
+            /// The path for DB to repair
+            #[clap(parse(from_os_str))]
+            index: PathBuf,
+
+            /// Repair using colors
+            #[clap(long = "colors")]
+            colors: bool,
+        },
+    */
     Check {
         /// The path for output
         #[clap(parse(from_os_str))]
@@ -270,6 +281,14 @@ fn check<P: AsRef<Path>>(
     Ok(())
 }
 
+/* TODO: need the repair_cf variant, not available in rocksdb-rust yet
+fn repair<P: AsRef<Path>>(output: P, colors: bool) {
+    info!("Starting repair");
+    RevIndex::repair(output.as_ref(), colors);
+    info!("Finished repair");
+}
+*/
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     use Commands::*;
@@ -321,7 +340,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let template = build_template(ksize, scaled);
 
             gather(query_path, index, template, threshold_bp, output, colors)?
-        }
+        } /* TODO: need the repair_cf variant, not available in rocksdb-rust yet
+                  Repair { index, colors } => repair(index, colors),
+          */
     };
 
     Ok(())
