@@ -50,12 +50,21 @@ pub fn repair(path: &Path) {
 */
 
 impl RevIndex {
-    pub fn open(path: &Path, read_only: bool) -> crate::RevIndex {
+    pub fn create(path: &Path) -> crate::RevIndex {
         let mut opts = crate::RevIndex::db_options();
-        if !read_only {
-            opts.create_if_missing(true);
-            opts.create_missing_column_families(true);
-        }
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+
+        // prepare column family descriptors
+        let cfs = cf_descriptors();
+
+        let db = Arc::new(DB::open_cf_descriptors(&opts, path, cfs).unwrap());
+
+        crate::RevIndex::Plain(Self { db })
+    }
+
+    pub fn open(path: &Path, read_only: bool) -> crate::RevIndex {
+        let opts = crate::RevIndex::db_options();
 
         // prepare column family descriptors
         let cfs = cf_descriptors();

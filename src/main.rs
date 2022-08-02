@@ -76,10 +76,6 @@ enum Commands {
         /// avoid deserializing data, and without stats
         #[clap(long = "quick")]
         quick: bool,
-
-        /// check using colors
-        #[clap(long = "colors")]
-        colors: bool,
     },
     Convert {
         /// The path for the input DB
@@ -114,10 +110,6 @@ enum Commands {
         /// The path for output
         #[clap(parse(from_os_str), short = 'o', long = "output")]
         output: Option<PathBuf>,
-
-        /// search using colors
-        #[clap(long = "colors")]
-        colors: bool,
     },
     Gather {
         /// Query signature
@@ -143,10 +135,6 @@ enum Commands {
         /// The path for output
         #[clap(parse(from_os_str), short = 'o', long = "output")]
         output: Option<PathBuf>,
-
-        /// search using colors
-        #[clap(long = "colors")]
-        colors: bool,
     },
 }
 
@@ -156,7 +144,6 @@ fn gather<P: AsRef<Path>>(
     template: Sketch,
     threshold_bp: usize,
     _output: Option<P>,
-    colors: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let query_sig = Signature::from_path(queries_file)?;
 
@@ -170,7 +157,7 @@ fn gather<P: AsRef<Path>>(
 
     let threshold = threshold_bp / query.scaled() as usize;
 
-    let db = RevIndex::open(index.as_ref(), false, colors);
+    let db = RevIndex::open(index.as_ref(), true);
     info!("Loaded DB");
 
     info!("Building counter");
@@ -206,7 +193,6 @@ fn search<P: AsRef<Path>>(
     template: Sketch,
     threshold_bp: usize,
     _output: Option<P>,
-    colors: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let query_sig = Signature::from_path(queries_file)?;
 
@@ -220,7 +206,7 @@ fn search<P: AsRef<Path>>(
 
     let threshold = threshold_bp / query.scaled() as usize;
 
-    let db = RevIndex::open(index.as_ref(), false, colors);
+    let db = RevIndex::open(index.as_ref(), true);
     info!("Loaded DB");
 
     info!("Building counter");
@@ -247,32 +233,29 @@ fn index<P: AsRef<Path>>(
     let index_sigs = read_paths(siglist)?;
     info!("Loaded {} sig paths in siglist", index_sigs.len());
 
-    let db = RevIndex::open(output.as_ref(), false, colors);
+    let db = RevIndex::create(output.as_ref(), colors);
     db.index(index_sigs, &template, threshold, save_paths);
 
     Ok(())
 }
 
 fn convert<P: AsRef<Path>>(input: P, output: P) -> Result<(), Box<dyn std::error::Error>> {
-    info!("Opening DB");
-    let db = RevIndex::open(input.as_ref(), false, false);
+    info!("Opening input DB");
+    let db = RevIndex::open(input.as_ref(), true);
 
-    info!("Opening DB");
-    let output_db = RevIndex::open(output.as_ref(), false, true);
+    info!("Creating output DB");
+    let output_db = RevIndex::create(output.as_ref(), true);
 
+    info!("Converting input DB");
     db.convert(output_db)?;
 
     info!("Finished conversion");
     Ok(())
 }
 
-fn check<P: AsRef<Path>>(
-    output: P,
-    quick: bool,
-    colors: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn check<P: AsRef<Path>>(output: P, quick: bool) -> Result<(), Box<dyn std::error::Error>> {
     info!("Opening DB");
-    let db = RevIndex::open(output.as_ref(), false, colors);
+    let db = RevIndex::open(output.as_ref(), true);
 
     info!("Starting check");
     db.check(quick);
@@ -309,11 +292,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             index(siglist, template, threshold, output, save_paths, colors)?
         }
-        Check {
-            output,
-            quick,
-            colors,
-        } => check(output, quick, colors)?,
+        Check { output, quick } => check(output, quick)?,
         Convert { input, output } => convert(input, output)?,
         Search {
             query_path,
@@ -322,11 +301,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             threshold_bp,
             ksize,
             scaled,
-            colors,
         } => {
             let template = build_template(ksize, scaled);
 
-            search(query_path, index, template, threshold_bp, output, colors)?
+            search(query_path, index, template, threshold_bp, output)?
         }
         Gather {
             query_path,
@@ -335,11 +313,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             threshold_bp,
             ksize,
             scaled,
-            colors,
         } => {
             let template = build_template(ksize, scaled);
 
-            gather(query_path, index, template, threshold_bp, output, colors)?
+            gather(query_path, index, template, threshold_bp, output)?
         } /* TODO: need the repair_cf variant, not available in rocksdb-rust yet
                   Repair { index, colors } => repair(index, colors),
           */

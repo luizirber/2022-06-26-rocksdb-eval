@@ -100,7 +100,7 @@ impl RevIndex {
 
     pub fn convert(&self, output_db: RevIndex) -> Result<(), Box<dyn std::error::Error>> {
         match self {
-            Self::Color(db) => todo!(),
+            Self::Color(_db) => todo!(),
             Self::Plain(db) => db.convert(output_db),
         }
     }
@@ -112,9 +112,22 @@ impl RevIndex {
         }
     }
 
-    pub fn open(index: &Path, read_only: bool, colors: bool) -> Self {
+    pub fn create(index: &Path, colors: bool) -> Self {
         if colors {
-            color_revindex::ColorRevIndex::open(index, read_only)
+            color_revindex::ColorRevIndex::create(index)
+        } else {
+            revindex::RevIndex::create(index)
+        }
+    }
+
+    pub fn open(index: &Path, read_only: bool) -> Self {
+        let opts = Self::db_options();
+        let cfs = DB::list_cf(&opts, index).unwrap();
+
+        if cfs.into_iter().any(|c| c == COLORS) {
+            // TODO: ColorRevIndex can't be read-only for now,
+            //       due to pending unmerged colors
+            color_revindex::ColorRevIndex::open(index, false)
         } else {
             revindex::RevIndex::open(index, read_only)
         }

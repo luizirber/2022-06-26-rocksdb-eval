@@ -76,14 +76,11 @@ impl ColorRevIndex {
         datasets.as_bytes()
     }
 
-    pub fn open(path: &Path, read_only: bool) -> RevIndex {
-        let mut opts = crate::RevIndex::db_options();
-
-        if !read_only {
-            opts.create_if_missing(true);
-            //opts.create_missing_column_families(true);
-        }
-
+    fn cf_descriptors() -> (
+        Vec<ColumnFamilyDescriptor>,
+        flume::Receiver<(Option<Color>, Datasets)>,
+        flume::Sender<Color>,
+    ) {
         let (tx_merge, rx_merge) = flume::unbounded();
         let (tx_colors, rx_colors) = flume::unbounded();
 
@@ -149,6 +146,30 @@ impl ColorRevIndex {
         let cf_sigs = ColumnFamilyDescriptor::new(SIGS, cfopts);
 
         let cfs = vec![cf_hashes, cf_sigs, cf_colors];
+
+        (cfs, rx_merge, tx_colors)
+    }
+
+    pub fn create(path: &Path) -> RevIndex {
+        let mut opts = crate::RevIndex::db_options();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+
+        let (cfs, rx_merge, tx_colors) = Self::cf_descriptors();
+
+        let db = Arc::new(DB::open_cf_descriptors(&opts, path, cfs).unwrap());
+
+        RevIndex::Color(Self {
+            db,
+            rx_merge,
+            tx_colors,
+        })
+    }
+
+    pub fn open(path: &Path, read_only: bool) -> RevIndex {
+        let opts = crate::RevIndex::db_options();
+
+        let (cfs, rx_merge, tx_colors) = Self::cf_descriptors();
 
         let db = if read_only {
             //TODO: error_if_log_file_exists set to false, is that an issue?
