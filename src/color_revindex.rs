@@ -274,7 +274,7 @@ impl ColorRevIndex {
         counter
     }
 
-    pub fn matches_from_counter(self, counter: SigCounter, threshold: usize) -> Vec<String> {
+    pub fn matches_from_counter(&self, counter: SigCounter, threshold: usize) -> Vec<String> {
         let finished = Arc::new(AtomicBool::new(false));
         let color_writer = self.set_up_color_writer(finished.clone());
 
