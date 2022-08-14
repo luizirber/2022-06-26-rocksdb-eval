@@ -54,9 +54,13 @@ impl RevIndex {
         }
     }
 
-    pub fn matches_from_counter(&self, counter: SigCounter, threshold: usize) -> Vec<String> {
+    pub fn matches_from_counter(
+        &self,
+        counter: SigCounter,
+        threshold: usize,
+    ) -> Vec<(String, usize)> {
         match self {
-            Self::Color(db) => db.matches_from_counter(counter, threshold),
+            Self::Color(db) => todo!(), //db.matches_from_counter(counter, threshold),
             Self::Plain(db) => db.matches_from_counter(counter, threshold),
         }
     }

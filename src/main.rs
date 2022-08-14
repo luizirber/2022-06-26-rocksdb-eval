@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use log::info;
 
-use sourmash::signature::Signature;
+use sourmash::signature::{Signature, SigsTrait};
 use sourmash::sketch::minhash::{max_hash_for_scaled, KmerMinHash};
 use sourmash::sketch::Sketch;
 
@@ -107,6 +107,10 @@ enum Commands {
         #[clap(short = 't', long = "threshold_bp", default_value = "50000")]
         threshold_bp: usize,
 
+        /// minimum containment to report
+        #[clap(short = 'c', long = "containment", default_value = "0.2")]
+        containment: f64,
+
         /// The path for output
         #[clap(parse(from_os_str), short = 'o', long = "output")]
         output: Option<PathBuf>,
@@ -192,6 +196,7 @@ fn search<P: AsRef<Path>>(
     index: P,
     template: Sketch,
     threshold_bp: usize,
+    minimum_containment: f64,
     _output: Option<P>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let query_sig = Signature::from_path(queries_file)?;
@@ -203,6 +208,7 @@ fn search<P: AsRef<Path>>(
         }
     }
     let query = query.expect("Couldn't find a compatible MinHash");
+    let query_size = query.size() as f64;
 
     let threshold = threshold_bp / query.scaled() as usize;
 
@@ -215,8 +221,24 @@ fn search<P: AsRef<Path>>(
 
     let matches = db.matches_from_counter(counter, threshold);
 
-    info!("matches: {}", matches.len());
-    //info!("matches: {:?}", matches);
+    //info!("matches: {}", matches.len());
+    println!("SRA ID,containment");
+    matches
+        .into_iter()
+        .filter_map(|(path, size)| {
+            let containment = size as f64 / query_size;
+            if containment >= minimum_containment {
+                println!(
+                    "{},{}",
+                    path.split("/").last().unwrap().split(".").next().unwrap(),
+                    containment
+                );
+                Some(())
+            } else {
+                None
+            }
+        })
+        .count();
 
     Ok(())
 }
@@ -301,10 +323,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             threshold_bp,
             ksize,
             scaled,
+            containment,
         } => {
             let template = build_template(ksize, scaled);
 
-            search(query_path, index, template, threshold_bp, output)?
+            search(
+                query_path,
+                index,
+                template,
+                threshold_bp,
+                containment,
+                output,
+            )?
         }
         Gather {
             query_path,

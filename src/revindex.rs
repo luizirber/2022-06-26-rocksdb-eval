@@ -189,7 +189,11 @@ impl RevIndex {
         (counter, query_colors, hash_to_colors)
     }
 
-    pub fn matches_from_counter(&self, counter: SigCounter, threshold: usize) -> Vec<String> {
+    pub fn matches_from_counter(
+        &self,
+        counter: SigCounter,
+        threshold: usize,
+    ) -> Vec<(String, usize)> {
         let cf_sigs = self.db.cf_handle(SIGS).unwrap();
 
         let matches_iter = counter
@@ -201,22 +205,25 @@ impl RevIndex {
                     (&mut v[..])
                         .write_u64::<LittleEndian>(dataset_id)
                         .expect("error writing bytes");
-                    Some((&cf_sigs, v))
+                    Some((&cf_sigs, v, size))
                 } else {
                     None
                 }
             });
 
+        let matches_sizes = matches_iter.clone().map(|(_, _, v)| v);
+
         info!("Multi get matches");
         self.db
-            .multi_get_cf(matches_iter)
-            .into_par_iter()
-            .filter_map(|r| r.ok().unwrap_or(None))
+            .multi_get_cf(matches_iter.map(|(k, v, _)| (k, v)))
+            .into_iter()
+            .zip(matches_sizes)
+            .filter_map(|(r, size)| r.ok().unwrap_or(None).map(|v| (v, size)))
             .filter_map(
-                |sigdata| match SignatureData::from_slice(&sigdata).unwrap() {
+                |(sigdata, size)| match SignatureData::from_slice(&sigdata).unwrap() {
                     SignatureData::Empty => None,
-                    SignatureData::External(p) => Some(p),
-                    SignatureData::Internal(sig) => Some(sig.name()),
+                    SignatureData::External(p) => Some((p, size)),
+                    SignatureData::Internal(sig) => Some((sig.name(), size)),
                 },
             )
             .collect()

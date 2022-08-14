@@ -133,7 +133,10 @@
             llvmPackages_13.libcxxClang
             llvmPackages_13.lldb
 
+            linuxPackages_latest.perf
+
             snakemake
+            parallel-full
           ];
 
           BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${llvmPackages_13.libclang.lib}/lib/clang/${lib.getVersion clang}/include";
