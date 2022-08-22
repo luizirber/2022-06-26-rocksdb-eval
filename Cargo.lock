@@ -982,20 +982,13 @@ dependencies = [
 name = "rocks-eval"
 version = "0.1.0"
 dependencies = [
- "byteorder",
  "clap",
- "counter",
  "env_logger",
- "flume",
  "histogram",
  "log",
  "numsep",
- "rayon",
- "rkyv",
- "rocksdb",
  "size",
  "sourmash",
- "twox-hash",
 ]
 
 [[package]]
@@ -1096,7 +1089,7 @@ checksum = "9f1341053f34bb13b5e9590afb7d94b48b48d4b87467ec28e3c238693bb553de"
 [[package]]
 name = "sourmash"
 version = "0.11.0"
-source = "git+https://github.com/sourmash-bio/sourmash?branch=lirber/rkyv_mh#874228dc517aa916539b70be0386d52b3f350172"
+source = "git+https://github.com/sourmash-bio/sourmash?branch=lirber/mastiff#1d98b79474e35edafb766fd1b7942db2e66e2c1c"
 dependencies = [
  "az",
  "bytecount",
@@ -1104,6 +1097,7 @@ dependencies = [
  "cfg-if",
  "counter",
  "fixedbitset",
+ "flume",
  "getset",
  "log",
  "md5",
@@ -1116,7 +1110,9 @@ dependencies = [
  "ouroboros",
  "piz",
  "primal-check",
+ "rayon",
  "rkyv",
+ "rocksdb",
  "serde",
  "serde_json",
  "thiserror",

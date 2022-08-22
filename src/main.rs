@@ -3,11 +3,10 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use log::info;
 
+use sourmash::index::revindex::{prepare_query, read_paths, RevIndex};
 use sourmash::signature::{Signature, SigsTrait};
 use sourmash::sketch::minhash::{max_hash_for_scaled, KmerMinHash};
 use sourmash::sketch::Sketch;
-
-use rocks_eval::{prepare_query, read_paths, RevIndex};
 
 fn build_template(ksize: u8, scaled: usize) -> Sketch {
     let max_hash = max_hash_for_scaled(scaled as u64);
