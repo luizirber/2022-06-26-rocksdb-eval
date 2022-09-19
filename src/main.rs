@@ -1,9 +1,11 @@
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use log::info;
 
-use sourmash::index::revindex::{prepare_query, read_paths, RevIndex};
+use sourmash::index::revindex::{prepare_query, RevIndex};
 use sourmash::signature::{Signature, SigsTrait};
 use sourmash::sketch::minhash::{max_hash_for_scaled, KmerMinHash};
 use sourmash::sketch::Sketch;
@@ -16,6 +18,18 @@ fn build_template(ksize: u8, scaled: usize) -> Sketch {
         .max_hash(max_hash)
         .build();
     Sketch::MinHash(template_mh)
+}
+
+fn read_paths<P: AsRef<Path>>(paths_file: P) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let paths = BufReader::new(File::open(paths_file)?);
+    Ok(paths
+        .lines()
+        .map(|line| {
+            let mut path = PathBuf::new();
+            path.push(line.unwrap());
+            path
+        })
+        .collect())
 }
 
 #[derive(Parser, Debug)]
