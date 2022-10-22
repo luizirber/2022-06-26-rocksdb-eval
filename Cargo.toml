@@ -12,4 +12,4 @@ histogram = "0.6.9"
 log = "0.4.17"
 numsep = "0.1.12"
 size = "0.4.0"
-sourmash = { git = "https://github.com/sourmash-bio/sourmash", branch = "lirber/mastiff" }
+sourmash = { git = "https://github.com/sourmash-bio/sourmash", tag = "mastiff_roaring" }

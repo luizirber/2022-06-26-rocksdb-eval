@@ -70,6 +70,35 @@ enum Commands {
         #[clap(long = "colors")]
         colors: bool,
     },
+    Update {
+        /// List of signatures to search
+        #[clap(parse(from_os_str))]
+        siglist: PathBuf,
+
+        /// ksize
+        #[clap(short, long, default_value = "31")]
+        ksize: u8,
+
+        /// threshold
+        #[clap(short, long, default_value = "0")]
+        threshold: f64,
+
+        /// scaled
+        #[clap(short, long, default_value = "1000")]
+        scaled: usize,
+
+        /// save paths to signatures into index. Default: save full sig into index
+        #[clap(long)]
+        save_paths: bool,
+
+        /// The path for output
+        #[clap(parse(from_os_str), short, long)]
+        output: PathBuf,
+
+        /// Index using colors
+        #[clap(long = "colors")]
+        colors: bool,
+    },
     /* TODO: need the repair_cf variant, not available in rocksdb-rust yet
         Repair {
             /// The path for DB to repair
@@ -274,6 +303,24 @@ fn index<P: AsRef<Path>>(
     Ok(())
 }
 
+fn update<P: AsRef<Path>>(
+    siglist: P,
+    template: Sketch,
+    threshold: f64,
+    output: P,
+    save_paths: bool,
+    _colors: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    info!("Loading siglist");
+    let index_sigs = read_paths(siglist)?;
+    info!("Loaded {} sig paths in siglist", index_sigs.len());
+
+    let db = RevIndex::open(output.as_ref(), false);
+    db.update(index_sigs, &template, threshold, save_paths);
+
+    Ok(())
+}
+
 fn convert<P: AsRef<Path>>(input: P, output: P) -> Result<(), Box<dyn std::error::Error>> {
     info!("Opening input DB");
     let db = RevIndex::open(input.as_ref(), true);
@@ -326,6 +373,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let template = build_template(ksize, scaled);
 
             index(siglist, template, threshold, output, save_paths, colors)?
+        }
+        Update {
+            output,
+            siglist,
+            threshold,
+            ksize,
+            scaled,
+            save_paths,
+            colors,
+        } => {
+            let template = build_template(ksize, scaled);
+
+            update(siglist, template, threshold, output, save_paths, colors)?
         }
         Check { output, quick } => check(output, quick)?,
         Convert { input, output } => convert(input, output)?,
