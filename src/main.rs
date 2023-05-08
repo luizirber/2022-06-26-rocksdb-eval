@@ -18,6 +18,8 @@ fn build_template(ksize: u8, scaled: usize, moltype: String) -> Sketch {
         "protein" => murmur64_protein,
         _ => panic!("Unknown moltype: {}", moltype),
     };
+    // if protein, multiply ksize by three
+    let ksize = if moltype == "protein" { ksize * 3 } else { ksize };
     let template_mh = KmerMinHash::builder()
         .hash_function(hash_function)
         .num(0u32)
