@@ -9,10 +9,17 @@ use sourmash::index::revindex::{prepare_query, RevIndex};
 use sourmash::signature::{Signature, SigsTrait};
 use sourmash::sketch::minhash::{max_hash_for_scaled, KmerMinHash};
 use sourmash::sketch::Sketch;
+use sourmash::encodings::HashFunctions::{murmur64_DNA, murmur64_protein};
 
-fn build_template(ksize: u8, scaled: usize) -> Sketch {
+fn build_template(ksize: u8, scaled: usize, moltype: String) -> Sketch {
     let max_hash = max_hash_for_scaled(scaled as u64);
+    let hash_function = match moltype.as_str() {
+        "dna" => murmur64_DNA,
+        "protein" => murmur64_protein,
+        _ => panic!("Unknown moltype: {}", moltype),
+    };
     let template_mh = KmerMinHash::builder()
+        .hash_function(hash_function)
         .num(0u32)
         .ksize(ksize as u32)
         .max_hash(max_hash)
@@ -58,6 +65,10 @@ enum Commands {
         #[clap(short, long, default_value = "1000")]
         scaled: usize,
 
+        /// moltype
+        #[clap(short, long, default_value = "dna")]
+        moltype: String,
+
         /// save paths to signatures into index. Default: save full sig into index
         #[clap(long)]
         save_paths: bool,
@@ -86,6 +97,10 @@ enum Commands {
         /// scaled
         #[clap(short, long, default_value = "1000")]
         scaled: usize,
+
+        /// moltype
+        #[clap(short, long, default_value = "dna")]
+        moltype: String,
 
         /// save paths to signatures into index. Default: save full sig into index
         #[clap(long)]
@@ -145,6 +160,10 @@ enum Commands {
         #[clap(short = 's', long = "scaled", default_value = "1000")]
         scaled: usize,
 
+        /// moltype
+        #[clap(short, long, default_value = "dna")]
+        moltype: String,
+
         /// threshold_bp
         #[clap(short = 't', long = "threshold_bp", default_value = "50000")]
         threshold_bp: usize,
@@ -173,6 +192,10 @@ enum Commands {
         /// scaled
         #[clap(short = 's', long = "scaled", default_value = "1000")]
         scaled: usize,
+
+        /// moltype
+        #[clap(short, long, default_value = "dna")]
+        moltype: String,
 
         /// threshold_bp
         #[clap(short = 't', long = "threshold_bp", default_value = "50000")]
@@ -367,10 +390,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             threshold,
             ksize,
             scaled,
+            moltype,
             save_paths,
             colors,
         } => {
-            let template = build_template(ksize, scaled);
+            let template = build_template(ksize, scaled, moltype);
 
             index(siglist, template, threshold, output, save_paths, colors)?
         }
@@ -380,10 +404,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             threshold,
             ksize,
             scaled,
+            moltype,
             save_paths,
             colors,
         } => {
-            let template = build_template(ksize, scaled);
+            let template = build_template(ksize, scaled, moltype);
 
             update(siglist, template, threshold, output, save_paths, colors)?
         }
@@ -396,9 +421,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             threshold_bp,
             ksize,
             scaled,
+            moltype,
             containment,
         } => {
-            let template = build_template(ksize, scaled);
+            let template = build_template(ksize, scaled, moltype);
 
             search(
                 query_path,
@@ -416,8 +442,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             threshold_bp,
             ksize,
             scaled,
+            moltype,
         } => {
-            let template = build_template(ksize, scaled);
+            let template = build_template(ksize, scaled, moltype);
 
             gather(query_path, index, template, threshold_bp, output)?
         } /* TODO: need the repair_cf variant, not available in rocksdb-rust yet
