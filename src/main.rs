@@ -341,7 +341,7 @@ fn update<P: AsRef<Path>>(
     info!("Loaded {} sig paths in siglist", index_sigs.len());
 
     let db = RevIndex::open(output.as_ref(), false);
-    db.update(index_sigs, &template, threshold, save_paths);
+    // db.update(index_sigs, &template, threshold, save_paths);
 
     Ok(())
 }

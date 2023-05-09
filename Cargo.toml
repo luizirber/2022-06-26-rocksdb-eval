@@ -12,4 +12,7 @@ histogram = "0.6.9"
 log = "0.4.17"
 numsep = "0.1.12"
 size = "0.4.0"
-sourmash = { git = "https://github.com/sourmash-bio/sourmash", tag = "mastiff_roaring" }
+sourmash = { git = "https://github.com/sourmash-bio/sourmash", branch = "ntp/mastiff_roaring_prot" }
+
+# use a local copy of the sourmash mastiff branch so I can try editing and/or use the newer code
+#sourmash = { path = "/Users/ntward/dib-lab/sourmash/src/core" }
